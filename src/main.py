@@ -67,7 +67,7 @@ if __name__ == "__main__":
     parser.add_argument("--id",         required=True)
     parser.add_argument("--secret",     required=True)
     parser.add_argument("--hub-secret", nargs='?', default="", const="")
-    parser.add_argument("--hub",        required=True)
+    parser.add_argument("--hub",        default=os.getenv("HUB_URL") or "auto")  # was required; default to auto-discovery (won't argparse-crash standalone)
     args = parser.parse_args()
 
     cp = DHCPControlPlane(args.id, args.secret, args.hub_secret, args.hub)
