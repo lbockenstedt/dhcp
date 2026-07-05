@@ -52,7 +52,7 @@ class DHCPControlPlane(BaseControlPlane):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.module_type = "dhcp"
         self.config = {
-            "KEA_URL": os.getenv("KEA_URL", "http://localhost:8000"),
+            "KEA_URL": os.getenv("KEA_URL", "http://localhost:8001"),  # Kea CA (:8000 collides with the LM hub)
         }
 
     async def run(self):

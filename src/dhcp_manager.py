@@ -9,7 +9,7 @@ logger = logging.getLogger("DHCPManager")
 class DHCPManager:
     """Kea DHCP4 control-agent client. Sends JSON commands to the Kea Control Agent REST API."""
 
-    def __init__(self, control_url: str = "http://localhost:8000"):
+    def __init__(self, control_url: str = "http://localhost:8001"):  # Kea CA (:8000 collides with the LM hub)
         self.url = control_url.rstrip("/")
 
     async def _cmd(self, command: str, service: str = "dhcp4", arguments: Dict = None) -> Dict[str, Any]:
@@ -23,7 +23,11 @@ class DHCPManager:
             data = r.json()
             # Kea returns a list of per-service results
             result = data[0] if isinstance(data, list) else data
-            if result.get("result", 0) != 0:
+            # Kea returns CONTROL_RESULT_EMPTY (3) for a VALID empty result — e.g.
+            # subnet4-list / lease4-get-all / reservation-get-all on a fresh server.
+            # Treat 3 as success (empty), only non-0/3 codes are real errors; else a
+            # brand-new server would raise "Kea error" instead of returning [].
+            if result.get("result", 0) not in (0, 3):
                 raise RuntimeError(result.get("text", "Kea error"))
             return result.get("arguments", {})
 
