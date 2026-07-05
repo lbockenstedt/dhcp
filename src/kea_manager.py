@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import requests
 import ipaddress
 
@@ -214,6 +215,72 @@ class KeaManager:
             ]
         self._set_config(cfg)
         return {"status": "SUCCESS"}
+
+    # ── Statistics ────────────────────────────────────────────────────
+
+    def get_stats(self) -> dict:
+        """Kea DHCP4 statistics via ``statistic-get-all``, normalized for the UI.
+
+        Kea returns each statistic as a list of ``[value, timestamp]`` samples
+        (newest first), plus per-subnet keys of the form
+        ``subnet[<id>].<name>``. We pull the latest sample of the pool-size /
+        assignment counters and derive a utilization percentage per subnet and
+        overall, and surface the headline packet counters.
+        """
+        try:
+            raw = self._rpc("dhcp4", "statistic-get-all", {})
+        except Exception as e:
+            logger.error("get_stats failed: %s", e)
+            return {"status": "ERROR", "message": str(e)}
+
+        def latest(key):
+            v = raw.get(key)
+            if isinstance(v, list) and v and isinstance(v[0], list) and v[0]:
+                return v[0][0]
+            return None
+
+        def num(key):
+            val = latest(key)
+            return val if isinstance(val, (int, float)) else 0
+
+        id_to_cidr = {s.get("id"): s.get("subnet", "") for s in self.list_subnets()}
+
+        subnet_ids = set()
+        for k in raw:
+            m = re.match(r"subnet\[(\d+)\]\.", k)
+            if m:
+                subnet_ids.add(int(m.group(1)))
+
+        subnets = []
+        for sid in sorted(subnet_ids):
+            total    = num(f"subnet[{sid}].total-addresses")
+            assigned = num(f"subnet[{sid}].assigned-addresses")
+            declined = num(f"subnet[{sid}].declined-addresses")
+            util = round(assigned / total * 100, 1) if total else 0.0
+            subnets.append({
+                "subnet_id":          sid,
+                "subnet":             id_to_cidr.get(sid, ""),
+                "total_addresses":    total,
+                "assigned_addresses": assigned,
+                "declined_addresses": declined,
+                "utilization_pct":    util,
+            })
+
+        g_total    = sum(s["total_addresses"] for s in subnets)
+        g_assigned = sum(s["assigned_addresses"] for s in subnets)
+        global_stats = {
+            "total_addresses":    g_total,
+            "assigned_addresses": g_assigned,
+            "declined_addresses": num("declined-addresses"),
+            "utilization_pct":    round(g_assigned / g_total * 100, 1) if g_total else 0.0,
+            "pkt4_received":      num("pkt4-received"),
+            "pkt4_discover":      num("pkt4-discover-received"),
+            "pkt4_request":       num("pkt4-request-received"),
+            "pkt4_offer_sent":    num("pkt4-offer-sent"),
+            "pkt4_ack_sent":      num("pkt4-ack-sent"),
+            "pkt4_nak_sent":      num("pkt4-nak-sent"),
+        }
+        return {"status": "SUCCESS", "global": global_stats, "subnets": subnets}
 
     def status(self) -> dict:
         try:

@@ -83,6 +83,9 @@ class DHCPSpoke(BaseSpoke):
         if cmd == "DHCP_STATUS":
             return {"status": "SUCCESS", **self.mgr.status()}
 
+        if cmd == "DHCP_STATS":
+            return self.mgr.get_stats()
+
         return {"status": "ERROR", "error": f"Unknown command: {command_type}"}
 
     async def get_status(self) -> Dict[str, Any]:
