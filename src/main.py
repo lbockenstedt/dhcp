@@ -1,3 +1,19 @@
+# Dependency self-heal — MUST run before the third-party imports below. A skewed
+# auto-update / partial install can leave the venv missing a declared dep, which
+# would hard-crash at import and crash-loop the unit under Restart=always.
+# dep_guard is stdlib-only; it find_spec-checks requirements.txt and pip-installs
+# any missing. Best-effort — an unavailable dep_guard is skipped, never fatal.
+import os as _os
+try:
+    try:
+        from core.src.dep_guard import ensure_requirements as _ensure_requirements
+    except ImportError:
+        from dep_guard import ensure_requirements as _ensure_requirements
+    _ensure_requirements(_os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "requirements.txt"))
+except Exception:
+    pass
+
 import asyncio
 import logging
 import argparse
