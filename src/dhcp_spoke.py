@@ -6,21 +6,31 @@ try:
 except ImportError:
     from core.src.base_spoke import BaseSpoke
 
-from .dhcp_manager import DHCPManager
+try:
+    from kea_manager import KeaManager
+except ImportError:  # loaded as a package (src.X) by the sibling entrypoint
+    from src.kea_manager import KeaManager
 
 logger = logging.getLogger("DHCPSpoke")
 
 
 class DHCPSpoke(BaseSpoke):
-    """Kea DHCP4 integration spoke."""
+    """
+    Kea DHCP4 spoke.
+
+    Commands:
+      DHCP_SYNC         — replace all subnets + reservations from NetBox data
+      DHCP_LIST_SUBNETS — list all managed subnets
+      DHCP_LIST_LEASES  — list active leases (optional subnet filter)
+      DHCP_ADD_RES      — add a static reservation
+      DHCP_DEL_RES      — remove a static reservation by IP
+      DHCP_STATUS       — Kea health + subnet count
+    """
 
     def __init__(self, spoke_id: str, config: Dict[str, Any]):
         super().__init__(spoke_id, config)
-        url = config.get("KEA_URL", "http://localhost:8000")
-        self.manager = DHCPManager(control_url=url)
-
-    def _rebuild_manager(self):
-        self.manager = DHCPManager(control_url=self.config.get("KEA_URL", "http://localhost:8000"))
+        ca_url = config.get("kea_ca_url", "http://localhost:8001")
+        self.mgr = KeaManager(ca_url=ca_url)
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         cmd = command_type.upper()
@@ -28,85 +38,62 @@ class DHCPSpoke(BaseSpoke):
         if cmd == "GET_VERSION":
             return {"status": "SUCCESS", "version": self.get_version()}
 
-        if cmd == "UPDATE_CONFIG":
-            self.config = data
-            self._rebuild_manager()
-            return {"status": "SUCCESS", "message": "DHCP config updated"}
-
-        if cmd == "DHCP_STATUS":
-            return await self.manager.status()
-
-        if cmd == "DHCP_LIST_SUBNETS":
-            try:
-                subnets = await self.manager.list_subnets()
-                return {"status": "SUCCESS", "subnets": subnets}
-            except Exception as e:
-                return {"status": "ERROR", "message": str(e)}
-
-        if cmd == "DHCP_LIST_LEASES":
-            subnet_id = data.get("subnet_id") or data.get("subnet")
-            try:
-                leases = await self.manager.list_leases(subnet_id=int(subnet_id) if subnet_id else None)
-                return {"status": "SUCCESS", "leases": leases}
-            except Exception as e:
-                return {"status": "ERROR", "message": str(e)}
-
-        if cmd == "DHCP_LIST_RES":
-            try:
-                reservations = await self.manager.list_reservations()
-                return {"status": "SUCCESS", "reservations": reservations}
-            except Exception as e:
-                return {"status": "ERROR", "message": str(e)}
-
-        if cmd == "DHCP_ADD_RES":
-            ip        = data.get("ip")
-            mac       = data.get("mac")
-            hostname  = data.get("hostname", "")
-            subnet_id = data.get("subnet_id")
-            if not ip or not mac or not subnet_id:
-                return {"status": "ERROR", "message": "ip, mac, and subnet_id are required"}
-            try:
-                return await self.manager.add_reservation(ip, mac, hostname, int(subnet_id))
-            except Exception as e:
-                return {"status": "ERROR", "message": str(e)}
-
-        if cmd == "DHCP_UPDATE_RES":
-            ip        = data.get("ip")
-            mac       = data.get("mac")
-            hostname  = data.get("hostname", "")
-            subnet_id = data.get("subnet_id")
-            if not ip or not subnet_id:
-                return {"status": "ERROR", "message": "ip and subnet_id are required"}
-            try:
-                await self.manager.delete_reservation(ip=ip, subnet_id=int(subnet_id))
-                return await self.manager.add_reservation(ip, mac, hostname, int(subnet_id))
-            except Exception as e:
-                return {"status": "ERROR", "message": str(e)}
-
-        if cmd == "DHCP_DEL_RES":
-            ip        = data.get("ip")
-            mac       = data.get("mac")
-            subnet_id = data.get("subnet_id")
-            if not subnet_id:
-                return {"status": "ERROR", "message": "subnet_id is required"}
-            try:
-                return await self.manager.delete_reservation(ip=ip, mac=mac, subnet_id=int(subnet_id))
-            except Exception as e:
-                return {"status": "ERROR", "message": str(e)}
-
         if cmd == "DHCP_SYNC":
             subnets      = data.get("subnets", [])
             reservations = data.get("reservations", [])
-            try:
-                return await self.manager.sync(subnets, reservations)
-            except Exception as e:
-                return {"status": "ERROR", "message": str(e)}
+            return self.mgr.sync(subnets, reservations)
 
-        logger.warning(f"Unknown command: {command_type}")
-        return {"status": "ERROR", "message": f"Unknown command: {command_type}"}
+        if cmd == "DHCP_LIST_SUBNETS":
+            return {"status": "SUCCESS", "subnets": self.mgr.list_subnets()}
+
+        if cmd == "DHCP_LIST_LEASES":
+            subnet = data.get("subnet")
+            return {"status": "SUCCESS", "leases": self.mgr.list_leases(subnet)}
+
+        if cmd == "DHCP_ADD_RES":
+            subnet_id = data.get("subnet_id")
+            ip        = data.get("ip")
+            mac       = data.get("mac")
+            hostname  = data.get("hostname", "")
+            if not all([subnet_id, ip, mac]):
+                return {"status": "ERROR", "message": "subnet_id, ip, and mac are required"}
+            return self.mgr.add_reservation(int(subnet_id), ip, mac, hostname)
+
+        if cmd == "DHCP_LIST_RES":
+            return {"status": "SUCCESS", "reservations": self.mgr.list_reservations()}
+
+        if cmd == "DHCP_UPDATE_RES":
+            old_ip    = data.get("old_ip") or data.get("ip")
+            subnet_id = data.get("subnet_id")
+            ip        = data.get("ip")
+            mac       = data.get("mac")
+            hostname  = data.get("hostname", "")
+            if not old_ip:
+                return {"status": "ERROR", "message": "old_ip is required"}
+            if not all([subnet_id, ip, mac]):
+                return {"status": "ERROR", "message": "subnet_id, ip, and mac are required"}
+            return self.mgr.update_reservation(old_ip, int(subnet_id), ip, mac, hostname)
+
+        if cmd == "DHCP_DEL_RES":
+            ip = data.get("ip")
+            if not ip:
+                return {"status": "ERROR", "message": "ip is required"}
+            return self.mgr.delete_reservation(ip)
+
+        if cmd == "DHCP_STATUS":
+            return {"status": "SUCCESS", **self.mgr.status()}
+
+        return {"status": "ERROR", "error": f"Unknown command: {command_type}"}
 
     async def get_status(self) -> Dict[str, Any]:
-        return await self.manager.status()
+        s = self.mgr.status()
+        return {
+            "spoke_id":     self.spoke_id,
+            "module":       "dhcp",
+            "kea":          "running" if s["running"] else "stopped",
+            "subnet_count": s["subnet_count"],
+            "status":       "HEALTHY" if s["running"] else "DEGRADED",
+        }
 
     def get_version(self) -> str:
         from pathlib import Path

@@ -12,7 +12,7 @@ Wraps the Kea Control Agent REST API for subnet/lease/reservation listing and CR
 
 ## Ports / backends
 
-Talks to the **Kea Control Agent** REST (`DHCPManager`, `src/dhcp_manager.py`) via `httpx`. Default `KEA_URL=http://localhost:8000`. Sends Kea JSON commands (`{"command","service":["dhcp4"],"arguments"}`) and returns `arguments` from the first result item. Commands: `subnet4-list`, `lease4-get-all`, `reservation-get-all`, `reservation-add`, `reservation-del`, `status-get`. No port served.
+Manages **Kea** via `KeaManager` (`src/kea_manager.py`) over the Kea Control Agent REST (`requests`). Default CA `http://localhost:8001` (`kea_ca_url` config / `KEA_URL` env; :8000 collides with the LM hub). Reservations are applied with **persisted** `config-set` + `config-write` (survive a `kea-dhcp4` restart), and a Kea result-code 3 (EMPTY) is treated as an empty success. No port served. **Reconciled** to the agent-role (`lm/dhcp`) implementation so the standalone-install and agent-role paths behave identically (previously this repo used an ephemeral `reservation-add` `DHCPManager` on :8000).
 
 ## Environment variables
 
@@ -28,7 +28,7 @@ None (no installer present).
 
 ## Key files
 
-`src/main.py`, `src/dhcp_spoke.py`, `src/dhcp_manager.py`, `src/__init__.py` (empty), `.env.template`, `requirements.txt` (`websockets, httpx, python-dotenv`), `VERSION`.
+`src/main.py`, `src/dhcp_spoke.py`, `src/kea_manager.py`, `src/__init__.py` (empty), `.env.template`, `requirements.txt` (`requests, websockets, python-dotenv`), `VERSION`.
 
 ## Notable behaviors & gotchas
 
