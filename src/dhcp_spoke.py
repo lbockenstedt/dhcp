@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Any, Dict
 
@@ -38,17 +39,27 @@ class DHCPSpoke(BaseSpoke):
         if cmd == "GET_VERSION":
             return {"status": "SUCCESS", "version": self.get_version()}
 
+        # KeaManager does sync requests.post to the Kea Control Agent (10s
+        # timeout) under every method, and DHCP_SYNC chains config-get +
+        # config-set + config-write + subnet4-list (3-4 RPCs). This role runs
+        # on the lm-svcs agent's ONE shared event loop alongside the dns + base
+        # role sub-spokes; a slow/hung Kea CA blocks the whole loop and the
+        # hub's 5s request_response fires for every in-flight request across
+        # all three sub-spokes at once. Offload each mgr call to a worker thread
+        # so the loop keeps servicing the other roles + the hub link.
         if cmd == "DHCP_SYNC":
             subnets      = data.get("subnets", [])
             reservations = data.get("reservations", [])
-            return self.mgr.sync(subnets, reservations)
+            return await asyncio.to_thread(self.mgr.sync, subnets, reservations)
 
         if cmd == "DHCP_LIST_SUBNETS":
-            return {"status": "SUCCESS", "subnets": self.mgr.list_subnets()}
+            subnets = await asyncio.to_thread(self.mgr.list_subnets)
+            return {"status": "SUCCESS", "subnets": subnets}
 
         if cmd == "DHCP_LIST_LEASES":
             subnet = data.get("subnet")
-            return {"status": "SUCCESS", "leases": self.mgr.list_leases(subnet)}
+            leases = await asyncio.to_thread(self.mgr.list_leases, subnet)
+            return {"status": "SUCCESS", "leases": leases}
 
         if cmd == "DHCP_ADD_RES":
             subnet_id = data.get("subnet_id")
@@ -57,10 +68,11 @@ class DHCPSpoke(BaseSpoke):
             hostname  = data.get("hostname", "")
             if not all([subnet_id, ip, mac]):
                 return {"status": "ERROR", "message": "subnet_id, ip, and mac are required"}
-            return self.mgr.add_reservation(int(subnet_id), ip, mac, hostname)
+            return await asyncio.to_thread(self.mgr.add_reservation, int(subnet_id), ip, mac, hostname)
 
         if cmd == "DHCP_LIST_RES":
-            return {"status": "SUCCESS", "reservations": self.mgr.list_reservations()}
+            reservations = await asyncio.to_thread(self.mgr.list_reservations)
+            return {"status": "SUCCESS", "reservations": reservations}
 
         if cmd == "DHCP_UPDATE_RES":
             old_ip    = data.get("old_ip") or data.get("ip")
@@ -72,24 +84,27 @@ class DHCPSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": "old_ip is required"}
             if not all([subnet_id, ip, mac]):
                 return {"status": "ERROR", "message": "subnet_id, ip, and mac are required"}
-            return self.mgr.update_reservation(old_ip, int(subnet_id), ip, mac, hostname)
+            return await asyncio.to_thread(self.mgr.update_reservation, old_ip, int(subnet_id), ip, mac, hostname)
 
         if cmd == "DHCP_DEL_RES":
             ip = data.get("ip")
             if not ip:
                 return {"status": "ERROR", "message": "ip is required"}
-            return self.mgr.delete_reservation(ip)
+            return await asyncio.to_thread(self.mgr.delete_reservation, ip)
 
         if cmd == "DHCP_STATUS":
-            return {"status": "SUCCESS", **self.mgr.status()}
+            s = await asyncio.to_thread(self.mgr.status)
+            return {"status": "SUCCESS", **s}
 
         if cmd == "DHCP_STATS":
-            return self.mgr.get_stats()
+            return await asyncio.to_thread(self.mgr.get_stats)
 
         return {"status": "ERROR", "error": f"Unknown command: {command_type}"}
 
     async def get_status(self) -> Dict[str, Any]:
-        s = self.mgr.status()
+        # Polled by the hub for telemetry — offload the sync Kea CA RPC off the
+        # shared loop (same reason as handle_command).
+        s = await asyncio.to_thread(self.mgr.status)
         out = {
             "spoke_id":     self.spoke_id,
             "module":       "dhcp",
