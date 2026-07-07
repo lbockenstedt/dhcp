@@ -15,6 +15,12 @@ class KeaManager:
 
     def __init__(self, ca_url: str = "http://localhost:8001"):
         self.ca_url = ca_url.rstrip("/")
+        # One keep-alive Session reused across every RPC (sync() alone can fire
+        # a config-get + config-set + config-write + subnet4-list in quick
+        # succession). A fresh connection per call paid a TCP+HTTP handshake
+        # every time; the shared Session holds the keep-alive connection so
+        # back-to-back RPCs reuse it.
+        self._session = requests.Session()
 
     # ── Kea Control Agent RPC ─────────────────────────────────────────
 
@@ -23,7 +29,7 @@ class KeaManager:
         if args is not None:
             payload["arguments"] = args
         try:
-            r = requests.post(self.ca_url, json=payload, timeout=10)
+            r = self._session.post(self.ca_url, json=payload, timeout=10)
             r.raise_for_status()
             result = r.json()
             if isinstance(result, list):
