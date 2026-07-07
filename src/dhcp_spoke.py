@@ -90,13 +90,18 @@ class DHCPSpoke(BaseSpoke):
 
     async def get_status(self) -> Dict[str, Any]:
         s = self.mgr.status()
-        return {
+        out = {
             "spoke_id":     self.spoke_id,
             "module":       "dhcp",
             "kea":          "running" if s["running"] else "stopped",
             "subnet_count": s["subnet_count"],
             "status":       "HEALTHY" if s["running"] else "DEGRADED",
         }
+        # Carry the reason for a down CA into the telemetry frame so the hub
+        # surfaces it (single, deduped) instead of just "stopped".
+        if s.get("error"):
+            out["error"] = s["error"]
+        return out
 
     def get_version(self) -> str:
         from pathlib import Path

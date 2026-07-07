@@ -1,10 +1,17 @@
 import json
 import logging
 import re
+import time
 import requests
 import ipaddress
 
 logger = logging.getLogger("KeaManager")
+
+# While the Control Agent is known-unreachable, short-circuit RPCs for this
+# many seconds instead of paying the full 10s connect timeout on every command
+# the hub issues. A probe is still allowed once per window so recovery is
+# detected within ~one telemetry cycle.
+_CA_DOWN_COOLDOWN = 15.0
 
 
 class KeaManager:
@@ -21,10 +28,41 @@ class KeaManager:
         # every time; the shared Session holds the keep-alive connection so
         # back-to-back RPCs reuse it.
         self._session = requests.Session()
+        # Reachability state so a down CA is surfaced ONCE (on transition) and
+        # repeated RPCs short-circuit instead of each stalling for the full
+        # timeout. Cleared on the first successful RPC.
+        self._ca_down = False
+        self._ca_down_since = 0.0
+        self._ca_last_attempt = 0.0
+        self._ca_last_error = ""
 
     # ── Kea Control Agent RPC ─────────────────────────────────────────
 
+    def _mark_ca_up(self) -> None:
+        """Clear the unreachable state; log recovery once on the transition."""
+        if self._ca_down:
+            down_for = time.time() - self._ca_down_since
+            logger.info("Kea CA reachable again at %s (was down %.0fs)",
+                        self.ca_url, down_for)
+        self._ca_down = False
+        self._ca_last_error = ""
+
+    def _mark_ca_down(self, err: str) -> None:
+        """Enter unreachable state; log ONCE on the transition, not per call."""
+        self._ca_last_error = err
+        self._ca_last_attempt = time.time()
+        if not self._ca_down:
+            self._ca_down = True
+            self._ca_down_since = time.time()
+            logger.error("Kea CA unreachable at %s: %s (suppressing repeats "
+                         "until it recovers)", self.ca_url, err)
+
     def _rpc(self, service: str, command: str, args: dict = None) -> dict:
+        # Known-down: short-circuit within the cooldown so a burst of commands
+        # against a dead CA doesn't each block for the full timeout. Allow one
+        # probe per window through so recovery is detected.
+        if self._ca_down and (time.time() - self._ca_last_attempt) < _CA_DOWN_COOLDOWN:
+            raise RuntimeError(f"Kea CA unreachable: {self._ca_last_error}")
         payload = {"command": command, "service": [service]}
         if args is not None:
             payload["arguments"] = args
@@ -35,9 +73,13 @@ class KeaManager:
             if isinstance(result, list):
                 result = result[0]
             if result.get("result", 0) != 0:
+                # Reached the CA fine — this is a Kea-level error, not a
+                # reachability problem, so don't touch the down-state.
                 raise RuntimeError(result.get("text", "Kea error"))
+            self._mark_ca_up()
             return result.get("arguments", {})
         except requests.RequestException as e:
+            self._mark_ca_down(str(e))
             raise RuntimeError(f"Kea CA unreachable: {e}")
 
     # ── Subnet (scope) management ─────────────────────────────────────
@@ -294,8 +336,15 @@ class KeaManager:
             running = True
         except Exception:
             running = False
-        return {
+        out = {
             "running":      running,
             "subnet_count": len(self.list_subnets()) if running else 0,
             "ca_url":       self.ca_url,
         }
+        # Surface WHY it's down so the telemetry card shows an actionable
+        # reason ("Kea CA unreachable at …") instead of a bare "stopped".
+        if not running:
+            out["error"] = (f"Kea CA unreachable at {self.ca_url}"
+                            + (f": {self._ca_last_error}" if self._ca_last_error
+                               else " (is kea-ctrl-agent running?)"))
+        return out
