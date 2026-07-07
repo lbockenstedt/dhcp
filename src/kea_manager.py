@@ -278,8 +278,17 @@ class KeaManager:
         try:
             raw = self._rpc("dhcp4", "statistic-get-all", {})
         except Exception as e:
-            logger.error("get_stats failed: %s", e)
-            return {"status": "ERROR", "message": str(e)}
+            # Kea CA not reachable (e.g. kea-ctrl-agent not installed/running on
+            # this spoke). The DHCP module is legitimately dormant on a box
+            # without Kea — surface an IDLE state, not a red ERROR, so the
+            # Overview tile renders empty stats + a note instead of "Error:
+            # Kea CA unreachable …". The module-health tile still sees
+            # running=False via get_status telemetry.
+            logger.warning("get_stats: Kea CA unreachable at %s: %s", self.ca_url, e)
+            return {"status": "SUCCESS", "global": {}, "subnets": [],
+                    "kea_running": False,
+                    "note": f"Kea Control Agent not reachable at {self.ca_url} — "
+                            f"start kea-ctrl-agent to enable DHCP."}
 
         def latest(key):
             v = raw.get(key)
