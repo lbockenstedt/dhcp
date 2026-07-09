@@ -20,12 +20,16 @@ class DHCPSpoke(BaseSpoke):
     Kea DHCP4 spoke.
 
     Commands:
-      DHCP_SYNC         — replace all subnets + reservations from NetBox data
-      DHCP_LIST_SUBNETS — list all managed subnets
-      DHCP_LIST_LEASES  — list active leases (optional subnet filter)
-      DHCP_ADD_RES      — add a static reservation
-      DHCP_DEL_RES      — remove a static reservation by IP
-      DHCP_STATUS       — Kea health + subnet count
+      GET_VERSION        — spoke/version string
+      DHCP_SYNC          — replace all subnets + reservations from NetBox data
+      DHCP_LIST_SUBNETS  — list all managed subnets
+      DHCP_LIST_LEASES   — list active leases (optional subnet CIDR filter)
+      DHCP_LIST_RES      — list all static reservations across subnets
+      DHCP_ADD_RES       — add a static reservation (ip+mac+subnet_id required)
+      DHCP_UPDATE_RES    — replace a reservation (delete-then-add, non-atomic)
+      DHCP_DEL_RES       — remove a static reservation by IP
+      DHCP_STATUS        — Kea health + subnet count
+      DHCP_STATS         — statistic-get-all pool utilization + packet counters
     """
 
     def __init__(self, spoke_id: str, config: Dict[str, Any]):
@@ -34,6 +38,15 @@ class DHCPSpoke(BaseSpoke):
         self.mgr = KeaManager(ca_url=ca_url)
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch a hub command to the Kea manager.
+
+        Every ``KeaManager`` call is offloaded to a worker thread via
+        ``asyncio.to_thread``: the Kea Control Agent speaks sync HTTP
+        (``requests``) and ``DHCP_SYNC`` chains 3–4 RPCs, while this role
+        shares one event loop with the dns + base role sub-spokes — a slow
+        or hung Kea CA would otherwise block every in-flight request across
+        all three sub-spokes.
+        """
         cmd = command_type.upper()
 
         if cmd == "GET_VERSION":
