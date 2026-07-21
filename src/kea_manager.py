@@ -6,11 +6,19 @@ import ipaddress
 
 logger = logging.getLogger("KeaManager")
 
-# While the Control Agent is known-unreachable, short-circuit RPCs for this
-# many seconds instead of paying the full 10s connect timeout on every command
-# the hub issues. A probe is still allowed once per window so recovery is
-# detected within ~one telemetry cycle.
-_CA_DOWN_COOLDOWN = 15.0
+# While the Control Agent is known-unreachable, short-circuit READ RPCs for
+# this many seconds instead of paying the full 10s connect timeout on every
+# command the hub issues. Kept short so a recovered CA is reported healthy again
+# within one telemetry cycle rather than lingering DEGRADED. Write commands
+# (config-set / config-write) are ALWAYS exempted below so an operator-initiated
+# action still gets one real attempt. (Every call is offloaded via to_thread,
+# so the cooldown's original stall-avoidance purpose is largely moot.)
+_CA_DOWN_COOLDOWN = 4.0
+
+# Commands that mutate Kea state (operator-initiated writes). These bypass the
+# down-cooldown short-circuit so a fresh operator action always gets one real
+# attempt at the CA rather than being reflexively rejected.
+_WRITE_COMMANDS = frozenset({"config-set", "config-write"})
 
 
 class KeaManager:
@@ -57,10 +65,13 @@ class KeaManager:
                          "until it recovers)", self.ca_url, err)
 
     def _rpc(self, service: str, command: str, args: dict = None) -> dict:
-        # Known-down: short-circuit within the cooldown so a burst of commands
-        # against a dead CA doesn't each block for the full timeout. Allow one
-        # probe per window through so recovery is detected.
-        if self._ca_down and (time.time() - self._ca_last_attempt) < _CA_DOWN_COOLDOWN:
+        # Known-down: short-circuit READ commands within the cooldown so a burst
+        # of reads against a dead CA doesn't each block for the full timeout.
+        # Allow one probe per window through so recovery is detected. Write
+        # commands (config-set / config-write) are NEVER short-circuited — an
+        # operator-initiated write always gets one real attempt.
+        if (command not in _WRITE_COMMANDS and self._ca_down
+                and (time.time() - self._ca_last_attempt) < _CA_DOWN_COOLDOWN):
             raise RuntimeError(f"Kea CA unreachable: {self._ca_last_error}")
         payload = {"command": command, "service": [service]}
         if args is not None:
