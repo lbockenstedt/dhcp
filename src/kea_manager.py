@@ -122,6 +122,7 @@ class KeaManager:
             return {"status": "ERROR", "message": f"Cannot read Kea config: {e}"}
 
         kea_subnets = []
+        applied_reservations = [False] * len(reservations)
         for idx, s in enumerate(subnets, start=1):
             subnet_str = s.get("subnet", "")
             try:
@@ -162,7 +163,7 @@ class KeaManager:
             # or invalid ip) must be skipped, not KeyError/ValueError out of the
             # whole sync (which would then config-set the subnet with NO reservations).
             subnet_res = []
-            for r in reservations:
+            for res_idx, r in enumerate(reservations):
                 ip, mac = r.get("ip"), r.get("mac")
                 if not ip or not mac:
                     continue
@@ -177,10 +178,14 @@ class KeaManager:
                         "hw-address": mac.lower().replace("-", ":"),
                         "hostname": r.get("hostname", ""),
                     })
+                    applied_reservations[res_idx] = True
             if subnet_res:
                 kea_subnet["reservations"] = subnet_res
 
             kea_subnets.append(kea_subnet)
+
+        reservations_applied = sum(1 for applied in applied_reservations if applied)
+        reservations_skipped = len(reservations) - reservations_applied
 
         cfg["subnet4"] = kea_subnets
         try:
@@ -188,8 +193,11 @@ class KeaManager:
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
 
-        logger.info("Synced %d subnets, %d reservations to Kea", len(kea_subnets), len(reservations))
-        return {"status": "SUCCESS", "subnets": len(kea_subnets), "reservations": len(reservations)}
+        logger.info("Synced %d subnets, %d reservations to Kea (%d skipped)",
+                    len(kea_subnets), reservations_applied, reservations_skipped)
+        return {"status": "SUCCESS", "subnets": len(kea_subnets),
+                "reservations": reservations_applied,
+                "reservations_skipped": reservations_skipped}
 
     # ── Lease queries ─────────────────────────────────────────────────
 
@@ -246,23 +254,31 @@ class KeaManager:
 
     def update_reservation(self, old_ip: str, subnet_id: int, ip: str,
                            mac: str, hostname: str = "") -> dict:
-        """Update a reservation by IP. Implemented as delete-then-add since Kea
-        reservations live in the subnet config block and may move between
-        subnets when the IP changes."""
+        """Update a reservation by IP in one config write."""
         if not all([subnet_id, ip, mac]):
             return {"status": "ERROR", "message": "subnet_id, ip, and mac are required"}
-        # Remove the old reservation (by old IP) from any subnet.
         cfg = self.get_config()
+        target = None
         for sub in cfg.get("subnet4", []):
+            if sub["id"] == int(subnet_id):
+                target = sub
             sub["reservations"] = [
                 r for r in sub.get("reservations", [])
                 if r.get("ip-address") != old_ip
             ]
+        if target is None:
+            return {"status": "ERROR", "message": f"Subnet {subnet_id} not found"}
+        target.setdefault("reservations", [])
+        target["reservations"].append({
+            "ip-address": ip,
+            "hw-address": mac.lower().replace("-", ":"),
+            "hostname":   hostname,
+        })
         try:
             self._set_config(cfg)
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
-        return self.add_reservation(int(subnet_id), ip, mac, hostname)
+        return {"status": "SUCCESS"}
 
     def delete_reservation(self, ip: str) -> dict:
         cfg = self.get_config()
