@@ -1,11 +1,8 @@
 name: CI
 
 # Gates the dev -> qa -> main promotion flow. `qa` and `main` require a PR, so
-# without a status check those gates would verify nothing. This job is the
-# check: it must pass before a PR into qa or main can merge.
-#
-# Runs on PRs into every protected branch, and on direct pushes to dev (which
-# contributors are allowed to make, so dev needs its own signal).
+# without a status check those gates would verify nothing. This job is that
+# check. `dev` also runs on direct push, which contributors are allowed to make.
 
 on:
   push:
@@ -18,10 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # These spokes inherit BaseSpoke from the LM core repo (imported as
+      # This repo inherits BaseSpoke from the LM core repo (imported as
       # `base_spoke` / `core.src.base_spoke`). In dev that resolves via the
-      # sibling lm checkout; CI has to reproduce that layout explicitly or
-      # collection fails with ModuleNotFoundError: No module named 'core'.
+      # sibling lm checkout; alone in CI it fails with
+      # ModuleNotFoundError: No module named 'core', so reproduce the layout.
       - name: Check out LM core (BaseSpoke dependency)
         uses: actions/checkout@v4
         with:
@@ -34,12 +31,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest
-          # Non-fatal: the suite runs against stubs and must not be blocked by a
-          # transient index failure. A genuinely missing import still fails the
-          # test step below, which is what gates the merge.
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          # Requirements are NOT always at the repo root -- several repos declare
+          # them per component (lm-spoke/, agent/, core/ ...). Installing only a
+          # root requirements.txt silently left fastapi/httpx/websockets missing
+          # and every test module failed to import. Install all of them.
+          # Non-fatal: a transient index failure must not gate the merge; a
+          # genuinely missing import still fails the test step below.
+          while IFS= read -r req; do
+            echo "installing $req"
+            pip install -r "$req" || true
+          done < <(find . -name 'requirements*.txt' \
+                     -not -path './_lm/*' -not -path '*/venv/*' \
+                     -not -path '*/node_modules/*' | sort)
       - name: Run tests
-        # Scoped to tests/ so the vendored _lm checkout is never collected.
         env:
           PYTHONPATH: ${{ github.workspace }}/_lm:${{ github.workspace }}/_lm/core/src
         run: pytest -q tests
