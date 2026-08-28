@@ -1,3 +1,8 @@
+---
+summary: "Thin Kea DHCP4 management spoke. Repo: dhcp. moduletype = 'dhcp'. See architecture-topology.md."
+keywords: [auto, backends, behaviors, custom_fields, dhcp, dhcp_stats, dhcp_status, dhcp_update_res, kea_url, lm]
+---
+
 # dhcp — DHCP (Kea)
 
 Thin Kea DHCP4 management spoke. Repo: `dhcp`. `module_type = "dhcp"`. See [architecture-topology.md](architecture-topology.md).
