@@ -1,3 +1,8 @@
+---
+summary: "Doc index for the dhcp repo: links to this module's feature reference and the shared LM architecture/topology page."
+keywords: [dhcp, documentation, index]
+---
+
 # dhcp — docs
 
 This repo carries a copy of its LM feature page plus the shared topology page:
