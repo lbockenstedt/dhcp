@@ -1,0 +1,32 @@
+name: CI
+
+# Gates the dev -> qa -> main promotion flow. `qa` and `main` require a PR, so
+# without a status check those gates would verify nothing. This job is the
+# check: it must pass before a PR into qa or main can merge.
+#
+# Runs on PRs into every protected branch, and on direct pushes to dev (which
+# contributors are allowed to make, so dev needs its own signal).
+
+on:
+  push:
+    branches: [ dev ]
+  pull_request:
+    branches: [ main, qa, dev ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          # Non-fatal: the suite runs against stubs and must not be blocked by a
+          # transient index failure. A genuinely missing import still fails the
+          # test step below, which is what gates the merge.
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+      - name: Run tests
+        run: pytest -q
