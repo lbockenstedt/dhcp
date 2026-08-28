@@ -18,6 +18,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # These spokes inherit BaseSpoke from the LM core repo (imported as
+      # `base_spoke` / `core.src.base_spoke`). In dev that resolves via the
+      # sibling lm checkout; CI has to reproduce that layout explicitly or
+      # collection fails with ModuleNotFoundError: No module named 'core'.
+      - name: Check out LM core (BaseSpoke dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: lbockenstedt/lm
+          path: _lm
+          sparse-checkout: core
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - name: Install dependencies
@@ -29,4 +39,7 @@ jobs:
           # test step below, which is what gates the merge.
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
       - name: Run tests
-        run: pytest -q
+        # Scoped to tests/ so the vendored _lm checkout is never collected.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/_lm:${{ github.workspace }}/_lm/core/src
+        run: pytest -q tests
