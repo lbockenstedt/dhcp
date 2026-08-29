@@ -2,3 +2,16 @@
 __pycache__/
 *.pyc
 venv/
+
+# mTLS material and runtime secrets issued by the hub — never commit these
+certs/
+.env
+.env.lock
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+keys.json
+hub_secret.json
+secrets.json
