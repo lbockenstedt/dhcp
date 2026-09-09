@@ -82,6 +82,11 @@ class FakeMgr:
         self._tid()
         return {"status": "SUCCESS", "global": {"total_addresses": 254}}
 
+    def diagnostics(self):
+        self.calls.append(("diagnostics",))
+        self._tid()
+        return {"status": "SUCCESS", "healthy": True}
+
 
 @pytest.fixture
 def spoke():
@@ -126,6 +131,12 @@ def test_dhcp_sync_offloaded(spoke, loop):
     assert resp["status"] == "SUCCESS"
     assert resp["subnets"] == 1
     assert resp["reservations"] == 1
+    _assert_offloaded(spoke, loop)
+
+
+def test_dhcp_diagnostics_offloaded(spoke, loop):
+    resp = _run(loop, spoke.handle_command("DHCP_DIAGNOSTICS", {}))
+    assert resp == {"status": "SUCCESS", "healthy": True}
     _assert_offloaded(spoke, loop)
 
 
