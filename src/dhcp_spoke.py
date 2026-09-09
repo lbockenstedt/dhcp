@@ -30,6 +30,7 @@ class DHCPSpoke(BaseSpoke):
       DHCP_DEL_RES       — remove a static reservation by IP
       DHCP_STATUS        — Kea health + subnet count
       DHCP_STATS         — statistic-get-all pool utilization + packet counters
+      DHCP_DIAGNOSTICS   — service/config/interface/listener/lease evidence
     """
 
     def __init__(self, spoke_id: str, config: Dict[str, Any]):
@@ -108,6 +109,9 @@ class DHCPSpoke(BaseSpoke):
         if cmd == "DHCP_STATUS":
             s = await asyncio.to_thread(self.mgr.status)
             return {"status": "SUCCESS", **s}
+
+        if cmd == "DHCP_DIAGNOSTICS":
+            return await asyncio.to_thread(self.mgr.diagnostics)
 
         if cmd == "DHCP_STATS":
             return await asyncio.to_thread(self.mgr.get_stats)
