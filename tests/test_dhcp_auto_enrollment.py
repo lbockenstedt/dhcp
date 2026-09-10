@@ -1,7 +1,7 @@
+import asyncio
 from pathlib import Path
 import hashlib
 
-import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
@@ -36,8 +36,7 @@ def test_member_material_is_reissued_when_cached_key_does_not_match(tmp_path):
     assert repaired["ha_key_pem"] != second["ha_key_pem"]
 
 
-@pytest.mark.asyncio
-async def test_discovery_enrollment_returns_complete_per_node_bootstrap(
+def test_discovery_enrollment_returns_complete_per_node_bootstrap(
         tmp_path, monkeypatch):
     listener = tmp_path / "coordinator.crt"
     listener.write_text(
@@ -81,12 +80,12 @@ async def test_discovery_enrollment_returns_complete_per_node_bootstrap(
     monkeypatch.setattr("dhcp_spoke.socket.getfqdn",
                         lambda: "dhcp-management.example")
 
-    result = await spoke.handle_command("DHCP_HA_ENROLL_WORKERS", {
+    result = asyncio.run(spoke.handle_command("DHCP_HA_ENROLL_WORKERS", {
         "members": [
             {"id": "kea-a", "host": "10.0.1.10"},
             {"id": "kea-b", "host": "10.0.1.11"},
         ],
-    })
+    }))
 
     assert result["status"] == "SUCCESS"
     first = result["workers"]["kea-a"]
@@ -106,14 +105,14 @@ async def test_discovery_enrollment_returns_complete_per_node_bootstrap(
         return {"status": "SUCCESS"}
 
     spoke._apply_ha_config_locked = _apply
-    committed = await spoke.handle_command("DHCP_HA_COMMIT_ENROLLMENT", {})
+    committed = asyncio.run(
+        spoke.handle_command("DHCP_HA_COMMIT_ENROLLMENT", {}))
     assert committed["status"] == "SUCCESS"
     assert spoke._pending_enrollment == {}
     assert not Path(spoke._pending_enrollment_path).exists()
 
 
-@pytest.mark.asyncio
-async def test_enrollment_fails_when_worker_secret_is_not_persisted(
+def test_enrollment_fails_when_worker_secret_is_not_persisted(
         tmp_path, monkeypatch):
     listener = tmp_path / "coordinator.crt"
     listener.write_text(
@@ -149,19 +148,18 @@ async def test_enrollment_fails_when_worker_secret_is_not_persisted(
             "transaction": lambda self: _Transaction(),
         })()
 
-    result = await spoke.handle_command("DHCP_HA_ENROLL_WORKERS", {
+    result = asyncio.run(spoke.handle_command("DHCP_HA_ENROLL_WORKERS", {
         "members": [
             {"id": "kea-a", "host": "10.0.1.10"},
             {"id": "kea-b", "host": "10.0.1.11"},
         ],
-    })
+    }))
 
     assert result["status"] == "ERROR"
     assert "could not be persisted" in result["message"]
 
 
-@pytest.mark.asyncio
-async def test_commit_rejects_enrollment_staged_against_old_topology(tmp_path):
+def test_commit_rejects_enrollment_staged_against_old_topology(tmp_path):
     class _Transaction:
         async def __aenter__(self):
             return self
@@ -188,7 +186,8 @@ async def test_commit_rejects_enrollment_staged_against_old_topology(tmp_path):
             "transaction": lambda self: _Transaction(),
         })()
 
-    result = await spoke.handle_command("DHCP_HA_COMMIT_ENROLLMENT", {})
+    result = asyncio.run(
+        spoke.handle_command("DHCP_HA_COMMIT_ENROLLMENT", {}))
 
     assert result["status"] == "ERROR"
     assert "topology changed" in result["message"]
