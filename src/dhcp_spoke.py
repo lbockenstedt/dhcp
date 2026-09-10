@@ -1,6 +1,10 @@
 import asyncio
+import json
 import logging
 import os
+import secrets
+import socket
+from pathlib import Path
 from typing import Any, Dict, List
 
 try:
@@ -16,17 +20,19 @@ except ImportError:  # loaded as a package (src.X) by the sibling entrypoint
 try:
     from kea_ha import (
         DEFAULT_CLUSTER_CONFIG, DEFAULT_DESIRED_STATE, DHCP_WORKER_OPS,
-        KeaHAConfigError, UnsupportedHAMode, load_cluster_config, normalize_mode,
-        save_cluster_config,
+        KeaHAConfigError, UnsupportedHAMode, build_peers, load_cluster_config,
+        normalize_mode, save_cluster_config,
     )
     from kea_cluster import KeaHACoordinator
+    from ha_pki import issue_member_material
 except ImportError:  # loaded as a package (src.X) by the sibling entrypoint
     from src.kea_ha import (  # type: ignore
         DEFAULT_CLUSTER_CONFIG, DEFAULT_DESIRED_STATE, DHCP_WORKER_OPS,
-        KeaHAConfigError, UnsupportedHAMode, load_cluster_config, normalize_mode,
-        save_cluster_config,
+        KeaHAConfigError, UnsupportedHAMode, build_peers, load_cluster_config,
+        normalize_mode, save_cluster_config,
     )
     from src.kea_cluster import KeaHACoordinator  # type: ignore
+    from src.ha_pki import issue_member_material  # type: ignore
 
 logger = logging.getLogger("DHCPSpoke")
 
@@ -71,6 +77,12 @@ def _redact_members(members):
             clean["ha_password_set"] = bool(member.get("ha_password"))
         out.append(clean)
     return out
+
+
+def _topology_fingerprint(members, mode):
+    """Stable marker used to reject a stale staged enrollment."""
+    payload = {"members": members or [], "mode": mode or "hot-standby"}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 class _DisabledTransport:
@@ -140,6 +152,14 @@ class DHCPSpoke(BaseSpoke):
         self._cluster_config_path = config.get(
             "cluster_config",
             os.getenv("LM_DHCP_CLUSTER_CONFIG", DEFAULT_CLUSTER_CONFIG))
+        self._ha_pki_dir = config.get(
+            "ha_pki_dir",
+            os.getenv("LM_DHCP_HA_PKI_DIR", "/etc/lm-dhcp/ha-pki"))
+        self._pending_enrollment_path = config.get(
+            "pending_enrollment",
+            os.getenv("LM_DHCP_PENDING_ENROLLMENT",
+                      "/etc/lm-dhcp/pending-enrollment.json"))
+        self._pending_enrollment = self._load_pending_enrollment()
         persisted = load_cluster_config(self._cluster_config_path)
         members = config.get("cluster_members")
         if members is None:
@@ -181,9 +201,183 @@ class DHCPSpoke(BaseSpoke):
         Only a real HA pair binds a port — a single-host DHCP role must never
         open a listener it has no use for.
         """
-        return bool(self.cluster.enabled)
+        return bool(self.cluster.enabled or self._pending_enrollment)
 
-    async def _apply_ha_config(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def _load_pending_enrollment(self) -> Dict[str, Any]:
+        try:
+            with open(self._pending_enrollment_path, encoding="utf-8") as stream:
+                data = json.load(stream)
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not load pending DHCP enrollment: %s", exc)
+            return {}
+
+    def _save_pending_enrollment(self, data: Dict[str, Any]) -> None:
+        path = Path(self._pending_enrollment_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        self._pending_enrollment = data
+
+    def _clear_pending_enrollment(self) -> None:
+        self._pending_enrollment = {}
+        try:
+            os.unlink(self._pending_enrollment_path)
+        except FileNotFoundError:
+            pass
+
+    async def _enroll_workers(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Stage a discovered pair and return retry-stable node bootstraps."""
+        raw = data.get("members")
+        if not isinstance(raw, list) or len(raw) != 2:
+            return {"status": "ERROR",
+                    "message": "DHCP HA discovery requires exactly 2 members"}
+        members = []
+        seen = set()
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict):
+                return {"status": "ERROR", "message": "each member must be an object"}
+            member_id = str(item.get("id") or item.get("member_id") or "").strip()
+            host = str(item.get("host") or "").strip()
+            if not member_id or not host or member_id in seen:
+                return {"status": "ERROR",
+                        "message": "each member needs a distinct id and host"}
+            seen.add(member_id)
+            members.append({
+                "id": member_id,
+                "host": host,
+                "role": "primary" if index == 0 else "standby",
+            })
+
+        async with self.cluster.transaction():
+            cp = getattr(self, "control_plane", None)
+            worker_secret = (
+                cp.snapshot_agent_secret()
+                if cp is not None and hasattr(cp, "snapshot_agent_secret")
+                else "")
+            worker_secret = (
+                str(worker_secret or "").strip() or secrets.token_urlsafe(32))
+            pending = self._pending_enrollment
+            same_pair = [
+                (m.get("id"), m.get("host")) for m in pending.get("members", [])
+            ] == [(m["id"], m["host"]) for m in members]
+            old_members = list(getattr(self._transport, "members", []) or [])
+            ha_user = (
+                str(pending.get("ha_user") or "").strip() if same_pair else ""
+            ) or next(
+                (str(m.get("ha_user") or "").strip() for m in old_members
+                 if str(m.get("ha_user") or "").strip()),
+                "kea-ha")
+            ha_password = (
+                str(pending.get("ha_password") or "") if same_pair else ""
+            ) or next(
+                (str(m.get("ha_password") or "") for m in old_members
+                 if str(m.get("ha_password") or "")),
+                secrets.token_urlsafe(32))
+            for member in members:
+                member.update({
+                    "ha_user": ha_user,
+                    "ha_password": ha_password,
+                    "ha_trust_anchor": "/etc/kea/ha-tls/ha-ca.pem",
+                    "ha_cert": "/etc/kea/ha-tls/node.crt",
+                    "ha_key": "/etc/kea/ha-tls/node.key",
+                })
+            try:
+                build_peers(members, "hot-standby")
+            except KeaHAConfigError as exc:
+                return {"status": "ERROR", "message": str(exc)}
+            self._save_pending_enrollment({
+                "members": members,
+                "ha_user": ha_user,
+                "ha_password": ha_password,
+                "base_topology": _topology_fingerprint(
+                    old_members, self.cluster.mode),
+            })
+            if cp is None or not hasattr(cp, "set_agent_secret"):
+                return {"status": "ERROR",
+                        "message": "DHCP cluster control plane is unavailable"}
+            if not cp.set_agent_secret(worker_secret):
+                return {
+                    "status": "ERROR",
+                    "message": "DHCP worker secret could not be persisted",
+                }
+            listener = await cp.ensure_cluster_listener()
+            if not listener.get("ok"):
+                return {"status": "ERROR", "listener": listener,
+                        "message": "the DHCP cluster listener did not start: "
+                                   + (listener.get("error") or "unknown error")}
+
+            cert_path = Path(str(
+                getattr(cp, "_listener_cert", "") or
+                "/etc/lm-dhcp/tls/coordinator.crt"))
+            try:
+                coordinator_ca_pem = cert_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                return {"status": "ERROR",
+                        "message": f"could not read DHCP coordinator certificate: {exc}"}
+            if "-----BEGIN CERTIFICATE-----" not in coordinator_ca_pem:
+                return {"status": "ERROR",
+                        "message": "DHCP coordinator certificate is invalid"}
+
+            bootstraps = {}
+            try:
+                for member in members:
+                    material = await asyncio.to_thread(
+                        issue_member_material, self._ha_pki_dir,
+                        member["id"], member["host"])
+                    bootstraps[member["id"]] = {
+                        **material,
+                        "ha_user": ha_user,
+                        "ha_password": ha_password,
+                        "member_id": member["id"],
+                        "coordinator": socket.getfqdn() or socket.gethostname(),
+                        "worker_secret": worker_secret,
+                        "coordinator_ca_pem": coordinator_ca_pem,
+                        "ha_peers": [
+                            m["host"] for m in members
+                            if m["id"] != member["id"]],
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Could not issue DHCP HA member certificates")
+                return {"status": "ERROR",
+                        "message": f"could not issue DHCP HA certificates: {exc}"}
+            return {"status": "SUCCESS", "pending": True,
+                    "members": _redact_members(members), "workers": bootstraps}
+
+    async def _commit_worker_enrollment(self) -> Dict[str, Any]:
+        async with self.cluster.transaction():
+            pending = self._pending_enrollment
+            members = pending.get("members") or []
+            if len(members) != 2:
+                return {"status": "ERROR",
+                        "message": "No DHCP enrollment is pending"}
+            current_topology = _topology_fingerprint(
+                self._transport.members, self.cluster.mode)
+            if pending.get("base_topology") != current_topology:
+                return {
+                    "status": "ERROR",
+                    "message": "DHCP topology changed while enrollment was "
+                               "pending; run discovery again",
+                }
+            cp = getattr(self, "control_plane", None)
+            connected = set((getattr(cp, "connected_agents", None) or {}).keys())
+            missing = [m["id"] for m in members if m["id"] not in connected]
+            if missing:
+                return {"status": "ERROR", "waiting": missing,
+                        "message": "Waiting for DHCP workers: " + ", ".join(missing)}
+            result = await self._apply_ha_config_locked(
+                members, {"members": members, "mode": "hot-standby"})
+            if result.get("status") in ("SUCCESS", "PARTIAL"):
+                self._clear_pending_enrollment()
+            return result
+
+    async def _apply_ha_config(
+            self, data: Dict[str, Any], *, cancel_pending: bool = False
+    ) -> Dict[str, Any]:
         """``DHCP_HA_CONFIG`` — declare the Kea pair and the HA mode.
 
         Write-only fields (``worker_secret``, per-member ``ha_password``) are
@@ -209,7 +403,10 @@ class DHCPSpoke(BaseSpoke):
         # never interleave with a config apply (which would then push to, or
         # stand down, a node the other transaction is mid-way through).
         async with self.cluster.transaction():
-            return await self._apply_ha_config_locked(raw, data)
+            result = await self._apply_ha_config_locked(raw, data)
+            if cancel_pending and result.get("status") in ("SUCCESS", "PARTIAL"):
+                self._clear_pending_enrollment()
+            return result
 
     async def _apply_ha_config_locked(self, raw, data) -> Dict[str, Any]:
         previous = {
@@ -503,7 +700,13 @@ class DHCPSpoke(BaseSpoke):
             return {"status": "SUCCESS", "version": self.get_version()}
 
         if cmd == "DHCP_HA_CONFIG":
-            return await self._apply_ha_config(data)
+            return await self._apply_ha_config(data, cancel_pending=True)
+
+        if cmd == "DHCP_HA_ENROLL_WORKERS":
+            return await self._enroll_workers(data)
+
+        if cmd == "DHCP_HA_COMMIT_ENROLLMENT":
+            return await self._commit_worker_enrollment()
 
         if cmd == "DHCP_HA_STATUS":
             if not self.cluster.enabled:
