@@ -17,10 +17,87 @@ logger = logging.getLogger("KeaManager")
 # so the cooldown's original stall-avoidance purpose is largely moot.)
 _CA_DOWN_COOLDOWN = 4.0
 
-# Commands that mutate Kea state (operator-initiated writes). These bypass the
-# down-cooldown short-circuit so a fresh operator action always gets one real
-# attempt at the CA rather than being reflexively rejected.
-_WRITE_COMMANDS = frozenset({"config-set", "config-write"})
+# Commands that mutate Kea state (operator-initiated writes) or validate an
+# operator-supplied config. These bypass the down-cooldown short-circuit so a
+# fresh operator action always gets one real attempt at the CA rather than being
+# reflexively rejected.
+_WRITE_COMMANDS = frozenset({"config-set", "config-write", "config-test"})
+
+
+def build_subnet4(subnets: list, reservations: list) -> tuple:
+    """Translate LM/NetBox intent into Kea's ``subnet4`` list.
+
+    Returns ``(kea_subnets, applied_reservations, skipped_reservations)``.
+    Extracted from :meth:`KeaManager.sync` so an HA pair can be handed the
+    IDENTICAL scope + reservation block for both nodes — two nodes computing
+    their own subnet list independently is how a "HA pair" ends up handing out
+    overlapping addresses.
+    """
+    kea_subnets = []
+    applied = [False] * len(reservations)
+    for idx, s in enumerate(subnets, start=1):
+        subnet_str = s.get("subnet", "")
+        try:
+            net = ipaddress.ip_network(subnet_str, strict=False)
+        except ValueError:
+            logger.warning("Invalid subnet %s — skipping", subnet_str)
+            continue
+
+        pools = [
+            {"pool": f"{p['start']} - {p['end']}"}
+            for p in s.get("pools", [])
+            if p.get("start") and p.get("end")
+        ]
+        if not pools:
+            # Default pool: .10 → .254
+            first = int(net.network_address) + 10
+            last  = int(net.broadcast_address) - 1
+            pools = [{"pool": f"{ipaddress.ip_address(first)} - {ipaddress.ip_address(last)}"}]
+
+        kea_subnet = {
+            "id":     idx,
+            "subnet": str(net),
+            "pools":  pools,
+            "option-data": [],
+        }
+        if s.get("gateway"):
+            kea_subnet["option-data"].append(
+                {"name": "routers", "data": s["gateway"]}
+            )
+        dns = s.get("dns_servers", [])
+        if dns:
+            kea_subnet["option-data"].append(
+                {"name": "domain-name-servers", "data": ", ".join(dns)}
+            )
+
+        # Attach reservations that belong to this subnet. Guard ip/mac with
+        # .get and wrap ip_network in try — one malformed reservation (missing
+        # or invalid ip) must be skipped, not KeyError/ValueError out of the
+        # whole sync (which would then config-set the subnet with NO reservations).
+        subnet_res = []
+        for res_idx, r in enumerate(reservations):
+            ip, mac = r.get("ip"), r.get("mac")
+            if not ip or not mac:
+                continue
+            try:
+                in_subnet = (r.get("subnet") == subnet_str
+                             or net.overlaps(ipaddress.ip_network(f"{ip}/32")))
+            except ValueError:
+                continue  # malformed reservation IP
+            if in_subnet:
+                subnet_res.append({
+                    "ip-address": ip,
+                    "hw-address": mac.lower().replace("-", ":"),
+                    "hostname": r.get("hostname", ""),
+                })
+                applied[res_idx] = True
+        if subnet_res:
+            kea_subnet["reservations"] = subnet_res
+
+        kea_subnets.append(kea_subnet)
+
+    applied_count = sum(1 for flag in applied if flag)
+    return kea_subnets, applied_count, len(reservations) - applied_count
 
 
 class KeaManager:
@@ -111,6 +188,26 @@ class KeaManager:
         self._rpc("dhcp4", "config-set", {"Dhcp4": dhcp4_config})
         self._rpc("dhcp4", "config-write", {})
 
+    def apply_config(self, dhcp4_config: dict) -> dict:
+        """``config-set`` then ``config-write`` as two OBSERVABLE steps.
+
+        ``_set_config`` collapses both into one exception, which loses the one
+        distinction that matters for rollback: a ``config-write`` failure means
+        the new config is ALREADY RUNNING (config-set succeeded) but is not
+        persisted — the node is mutated and must be restored, whereas a
+        ``config-set`` failure left it untouched. Returns
+        ``{"set": bool, "written": bool, "error": str}``.
+        """
+        try:
+            self._rpc("dhcp4", "config-set", {"Dhcp4": dhcp4_config})
+        except Exception as e:  # noqa: BLE001 — a rejected config is the answer
+            return {"set": False, "written": False, "error": str(e)}
+        try:
+            self._rpc("dhcp4", "config-write", {})
+        except Exception as e:  # noqa: BLE001
+            return {"set": True, "written": False, "error": str(e)}
+        return {"set": True, "written": True, "error": ""}
+
     def sync(self, subnets: list, reservations: list) -> dict:
         """
         Full sync: replace all subnets and reservations.
@@ -123,71 +220,8 @@ class KeaManager:
         except Exception as e:
             return {"status": "ERROR", "message": f"Cannot read Kea config: {e}"}
 
-        kea_subnets = []
-        applied_reservations = [False] * len(reservations)
-        for idx, s in enumerate(subnets, start=1):
-            subnet_str = s.get("subnet", "")
-            try:
-                net = ipaddress.ip_network(subnet_str, strict=False)
-            except ValueError:
-                logger.warning("Invalid subnet %s — skipping", subnet_str)
-                continue
-
-            pools = [
-                {"pool": f"{p['start']} - {p['end']}"}
-                for p in s.get("pools", [])
-                if p.get("start") and p.get("end")
-            ]
-            if not pools:
-                # Default pool: .10 → .254
-                first = int(net.network_address) + 10
-                last  = int(net.broadcast_address) - 1
-                pools = [{"pool": f"{ipaddress.ip_address(first)} - {ipaddress.ip_address(last)}"}]
-
-            kea_subnet = {
-                "id":     idx,
-                "subnet": str(net),
-                "pools":  pools,
-                "option-data": [],
-            }
-            if s.get("gateway"):
-                kea_subnet["option-data"].append(
-                    {"name": "routers", "data": s["gateway"]}
-                )
-            dns = s.get("dns_servers", [])
-            if dns:
-                kea_subnet["option-data"].append(
-                    {"name": "domain-name-servers", "data": ", ".join(dns)}
-                )
-
-            # Attach reservations that belong to this subnet. Guard ip/mac with
-            # .get and wrap ip_network in try — one malformed reservation (missing
-            # or invalid ip) must be skipped, not KeyError/ValueError out of the
-            # whole sync (which would then config-set the subnet with NO reservations).
-            subnet_res = []
-            for res_idx, r in enumerate(reservations):
-                ip, mac = r.get("ip"), r.get("mac")
-                if not ip or not mac:
-                    continue
-                try:
-                    in_subnet = (r.get("subnet") == subnet_str
-                                 or net.overlaps(ipaddress.ip_network(f"{ip}/32")))
-                except ValueError:
-                    continue  # malformed reservation IP
-                if in_subnet:
-                    subnet_res.append({
-                        "ip-address": ip,
-                        "hw-address": mac.lower().replace("-", ":"),
-                        "hostname": r.get("hostname", ""),
-                    })
-                    applied_reservations[res_idx] = True
-            if subnet_res:
-                kea_subnet["reservations"] = subnet_res
-
-            kea_subnets.append(kea_subnet)
-
-        reservations_applied = sum(1 for applied in applied_reservations if applied)
-        reservations_skipped = len(reservations) - reservations_applied
+        kea_subnets, reservations_applied, reservations_skipped = build_subnet4(
+            subnets, reservations)
 
         cfg["subnet4"] = kea_subnets
         try:
