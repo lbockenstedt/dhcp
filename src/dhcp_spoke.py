@@ -684,12 +684,15 @@ class DHCPSpoke(BaseSpoke):
         action = "delete" if cmd == "DHCP_DEL_RES" else "upsert"
         res = await self.cluster.mutate_reservation(action, data)
         if res.get("status") == "SUCCESS" and action != "delete":
-            old_ip = data.get("old_ip") or data.get("ip")
-            if old_ip:
-                try:
-                    await self.cluster.transport.fanout("KEAW_DEL_LEASE", {"ip": old_ip})
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("Failed to purge old lease %s: %s", old_ip, e)
+            ip = data.get("ip")
+            old_ip = data.get("old_ip")
+            mac = data.get("mac")
+            try:
+                await self.cluster.transport.fanout("KEAW_DEL_LEASE", {"ip": ip, "old_ip": old_ip, "mac": mac})
+                if old_ip and old_ip != ip:
+                    await self.cluster.transport.fanout("KEAW_DEL_LEASE", {"ip": old_ip, "mac": mac})
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Failed to purge old lease for %s / %s: %s", mac, ip, e)
         return res
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:

@@ -265,9 +265,26 @@ class DhcpWorkerOps:
 
     def delete_lease(self, data: Dict[str, Any]) -> Dict[str, Any]:
         ip = data.get("ip") or data.get("ip-address")
-        if not ip:
-            return {"status": "ERROR", "message": "ip is required"}
-        return self.mgr.delete_lease(ip)
+        old_ip = data.get("old_ip")
+        mac = data.get("mac") or data.get("hw-address")
+        if not ip and not mac and not old_ip:
+            return {"status": "ERROR", "message": "ip, old_ip, or mac is required"}
+        purged = set()
+        if hasattr(self.mgr, "purge_leases_for_mac_or_ip"):
+            if ip:
+                purged.update(self.mgr.purge_leases_for_mac_or_ip(mac=mac, ip=ip))
+            if old_ip and old_ip != ip:
+                purged.update(self.mgr.purge_leases_for_mac_or_ip(mac=mac, ip=old_ip))
+            if mac and not ip and not old_ip:
+                purged.update(self.mgr.purge_leases_for_mac_or_ip(mac=mac))
+        else:
+            if ip:
+                self.mgr.delete_lease(ip)
+                purged.add(ip)
+            if old_ip and old_ip != ip:
+                self.mgr.delete_lease(old_ip)
+                purged.add(old_ip)
+        return {"status": "SUCCESS", "purged": list(purged)}
 
     def diagnostics(self, _data: Dict[str, Any]) -> Dict[str, Any]:
         return self.mgr.diagnostics()
