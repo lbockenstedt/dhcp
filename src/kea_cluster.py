@@ -391,7 +391,8 @@ class KeaHACoordinator:
         for member_id in order:
             reply = await self.transport.call(
                 member_id, "KEAW_APPLY",
-                {"config": configs[member_id], "version": candidate_version},
+                {"config": configs[member_id], "version": candidate_version,
+                 "hook_dir": self.hook_dir},
                 timeout=timeout)
             if reply.get("status") == "SUCCESS":
                 applied.append(member_id)
@@ -528,8 +529,10 @@ class KeaHACoordinator:
         }
         if status != "SUCCESS":
             nodes = ", ".join(failed) or "unknown"
+            err_details = "; ".join(f"{k}: {v}" for k, v in errors.items() if v)
+            detail_str = f" ({err_details})" if err_details else ""
             verdict["message"] = message or (
-                f"Kea HA {stage} failed on: {nodes}"
+                f"Kea HA {stage} failed on: {nodes}{detail_str}"
                 + (f"; rolled back {', '.join(rolled_back)}" if rolled_back else "")
                 + (f"; still applied on {', '.join(applied)}" if applied else ""))
             logger.error("Kea HA apply %s at stage %s — applied=%s failed=%s",

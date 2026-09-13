@@ -553,6 +553,7 @@ def test_a_node_whose_config_cannot_be_read_aborts_before_any_apply(tmp_path):
     out = _run(_coord(t, tmp_path).apply(SUBNETS, RESERVATIONS))
     assert out["status"] == "ERROR" and out["stage"] == "read-config"
     assert out["errors"]["kea-a"] == "CA unreachable"
+    assert "CA unreachable" in out["message"]
     assert not any(c[1] == "KEAW_APPLY" for c in t.calls)
 
 
