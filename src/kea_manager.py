@@ -382,6 +382,15 @@ class KeaManager:
             logger.error("list_leases failed: %s", e)
             return []
 
+    def delete_lease(self, ip: str) -> dict:
+        """Delete an active lease by IP from Kea via lease4-del RPC."""
+        try:
+            res = self._rpc("dhcp4", "lease4-del", {"ip-address": ip})
+            return {"status": "SUCCESS", "result": res}
+        except Exception as e:
+            logger.debug("delete_lease %s: %s", ip, e)
+            return {"status": "SUCCESS", "message": str(e), "not_found": True}
+
     # ── Manual reservation CRUD ───────────────────────────────────────
 
     def add_reservation(self, subnet_id: int, ip: str, mac: str, hostname: str = "") -> dict:
@@ -398,6 +407,7 @@ class KeaManager:
         else:
             return {"status": "ERROR", "message": f"Subnet {subnet_id} not found"}
         self._set_config(cfg)
+        self.delete_lease(ip)
         return {"status": "SUCCESS"}
 
     def list_reservations(self) -> list:
@@ -443,6 +453,10 @@ class KeaManager:
         })
         try:
             self._set_config(cfg)
+            if old_ip:
+                self.delete_lease(old_ip)
+            if ip and ip != old_ip:
+                self.delete_lease(ip)
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
         return {"status": "SUCCESS"}

@@ -263,6 +263,12 @@ class DhcpWorkerOps:
     def list_reservations(self, _data: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "SUCCESS", "reservations": self.mgr.list_reservations()}
 
+    def delete_lease(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        ip = data.get("ip") or data.get("ip-address")
+        if not ip:
+            return {"status": "ERROR", "message": "ip is required"}
+        return self.mgr.delete_lease(ip)
+
     def diagnostics(self, _data: Dict[str, Any]) -> Dict[str, Any]:
         return self.mgr.diagnostics()
 
@@ -282,6 +288,7 @@ class DhcpWorkerOps:
             "KEAW_LIST_SUBNETS": self.list_subnets,
             "KEAW_LIST_LEASES": self.list_leases,
             "KEAW_LIST_RES": self.list_reservations,
+            "KEAW_DEL_LEASE": self.delete_lease,
             "KEAW_DIAGNOSTICS": self.diagnostics,
             "KEAW_STATS": self.stats,
         }

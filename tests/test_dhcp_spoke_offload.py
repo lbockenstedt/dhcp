@@ -72,6 +72,11 @@ class FakeMgr:
         self._tid()
         return {"status": "SUCCESS"}
 
+    def delete_lease(self, ip):
+        self.calls.append(("delete_lease", ip))
+        self._tid()
+        return {"status": "SUCCESS"}
+
     def status(self):
         self.calls.append(("status",))
         self._tid()
@@ -196,6 +201,18 @@ def test_dhcp_del_res_offloaded(spoke, loop):
     resp = _run(loop, spoke.handle_command("DHCP_DEL_RES", {"ip": "10.0.0.5"}))
     assert resp["status"] == "SUCCESS"
     _assert_offloaded(spoke, loop)
+
+
+def test_dhcp_del_lease_offloaded(spoke, loop):
+    resp = _run(loop, spoke.handle_command("DHCP_DEL_LEASE", {"ip": "10.0.0.5"}))
+    assert resp["status"] == "SUCCESS"
+    _assert_offloaded(spoke, loop)
+
+
+def test_dhcp_del_lease_missing_ip(spoke, loop):
+    resp = _run(loop, spoke.handle_command("DHCP_DEL_LEASE", {}))
+    assert resp["status"] == "ERROR"
+    assert spoke.mgr.calls == []
 
 
 def test_dhcp_del_res_missing_ip_short_circuits(spoke, loop):
