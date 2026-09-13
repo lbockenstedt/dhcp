@@ -1,28 +1,80 @@
+import base64
+import copy
 import logging
 import re
-import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 import requests
 import ipaddress
 import os
+import shutil
 import subprocess
+import zlib
 
 logger = logging.getLogger("KeaManager")
 
-# While the Control Agent is known-unreachable, short-circuit READ RPCs for
-# this many seconds instead of paying the full 10s connect timeout on every
-# command the hub issues. Kept short so a recovered CA is reported healthy again
-# within one telemetry cycle rather than lingering DEGRADED. Write commands
-# (config-set / config-write) are ALWAYS exempted below so an operator-initiated
-# action still gets one real attempt. (Every call is offloaded via to_thread,
-# so the cooldown's original stall-avoidance purpose is largely moot.)
-_CA_DOWN_COOLDOWN = 4.0
 
-# Commands that mutate Kea state (operator-initiated writes) or validate an
-# operator-supplied config. These bypass the down-cooldown short-circuit so a
-# fresh operator action always gets one real attempt at the CA rather than being
-# reflexively rejected.
-_WRITE_COMMANDS = frozenset({"config-set", "config-write", "config-test"})
+def worker_code_version() -> dict:
+    """Best-effort ``{commit, commit_time, dirty}`` for the running worker's
+    own checkout — added because a recurring "same error keeps coming back"
+    report turned out to be a stale checkout that never received a merged
+    fix (this worker's only code-update path is re-running the installer;
+    there is no self-update). Surfacing the actual running commit + when it
+    landed in diagnostics lets an operator immediately tell "still on old
+    code" apart from "the fix is deployed but the failure is real", instead
+    of needing separate manual git access to the host.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    out = {"commit": "", "commit_time": "", "dirty": None}
+    if not shutil.which("git") or not os.path.isdir(os.path.join(repo_root, ".git")):
+        return out
+    try:
+        commit = subprocess.run(
+            ["git", "-C", repo_root, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=10)
+        if commit.returncode == 0:
+            out["commit"] = commit.stdout.strip()
+        ctime = subprocess.run(
+            ["git", "-C", repo_root, "log", "-1", "--format=%cI"],
+            capture_output=True, text=True, timeout=10)
+        if ctime.returncode == 0:
+            out["commit_time"] = ctime.stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", repo_root, "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10)
+        if dirty.returncode == 0:
+            out["dirty"] = bool(dirty.stdout.strip())
+    except Exception:  # noqa: BLE001 — best-effort only
+        pass
+    return out
+
+
+def _stable_subnet_id(subnet_str: str, taken: set) -> int:
+    """Deterministic Kea ``subnet-id`` for a CIDR, stable across syncs.
+
+    The old scheme assigned ``id = enumerate(subnets, start=1)`` — a bare
+    list POSITION. Any NetBox-side change that shifts the list (a scope
+    removed, reordered, or one inserted ahead of others) silently reassigns
+    every downstream subnet to a DIFFERENT numeric id on the very next sync.
+    Kea does not purge ``statistic-get-all`` history for an id that
+    disappears from ``subnet4`` on a ``config-set`` — those samples linger
+    in the running daemon's memory until it restarts — so each reshuffle
+    left the OLD id's stats behind as a permanent "Unknown scope (not in
+    NetBox — stale?)" 0/0 entry in the Overview, and every subsequent
+    NetBox edit minted a fresh batch of them.
+
+    Deriving the id from the CIDR itself instead means a given scope keeps
+    the same id release over release regardless of how many OTHER scopes
+    are added, removed, or reordered around it — nothing is orphaned, so
+    nothing goes stale. ``taken`` guards the astronomically unlikely CRC32
+    collision by linear-probing to the next free id.
+    """
+    base = zlib.crc32(subnet_str.encode()) & 0x7FFFFFFF or 1  # never 0
+    sid = base
+    while sid in taken:
+        sid = (sid % 0x7FFFFFFF) + 1
+    taken.add(sid)
+    return sid
 
 
 def _normalize_mac(mac: str) -> str:
@@ -36,7 +88,11 @@ def _normalize_mac(mac: str) -> str:
 
 
 def _add_option(kea_subnet: dict, name: str, value) -> None:
-    """Append one Kea ``option-data`` entry if ``value`` is non-empty."""
+    """Append one Kea ``option-data`` entry if ``value`` is non-empty.
+
+    ``value`` may be a plain string or a list (comma-joined the way Kea
+    expects a multi-value option, e.g. multiple NTP servers).
+    """
     if isinstance(value, (list, tuple)):
         value = ", ".join(v for v in value if v)
     if not value:
@@ -44,6 +100,12 @@ def _add_option(kea_subnet: dict, name: str, value) -> None:
     kea_subnet["option-data"].append({"name": name, "data": value})
 
 
+# Standard DHCPv4 options beyond gateway/DNS that a scope may carry, sourced
+# from the same NetBox prefix custom_fields as gateway/dns_servers (see
+# ``dns_dhcp_sync.build_dhcp_payload``). Table-driven so adding another
+# standard option is a one-line addition here plus the matching
+# custom_fields read on the sync side, instead of a new one-off `if` block
+# per option. Each entry is (subnet-dict key, Kea option-data "name").
 _ADVANCED_OPTION_MAP = [
     ("domain_name",          "domain-name"),
     ("ntp_servers",          "ntp-servers"),
@@ -145,13 +207,15 @@ def build_subnet4(subnets: list, reservations: list) -> tuple:
     """
     kea_subnets = []
     applied = [False] * len(reservations)
-    for idx, s in enumerate(subnets, start=1):
+    used_ids: set = set()
+    for s in subnets:
         subnet_str = s.get("subnet", "")
         try:
             net = ipaddress.ip_network(subnet_str, strict=False)
         except ValueError:
             logger.warning("Invalid subnet %s — skipping", subnet_str)
             continue
+        idx = _stable_subnet_id(subnet_str, used_ids)
 
         pools = [
             {"pool": f"{p['start']} - {p['end']}"}
@@ -192,6 +256,10 @@ def build_subnet4(subnets: list, reservations: list) -> tuple:
             "reservations-lookup-first": True,
             "reservation-mode": "all",
         }
+        # Carry the NetBox prefix description through in Kea's user-context so
+        # the UI can label a scope by its real name/purpose instead of a bare
+        # "subnet <id>" — Kea persists arbitrary user-context data untouched
+        # and returns it back on subnet4-list, so this round-trips for free.
         description = (s.get("description") or "").strip()
         if description:
             kea_subnet["user-context"] = {"description": description}
@@ -207,6 +275,9 @@ def build_subnet4(subnets: list, reservations: list) -> tuple:
         _add_option(kea_subnet, "domain-search", s.get("search_domains"))
         for key, opt_name in _ADVANCED_OPTION_MAP:
             _add_option(kea_subnet, opt_name, s.get(key))
+        # valid-lifetime is a Kea subnet-level property (the DHCP lease time
+        # in seconds), not an option-data entry — only set it when the scope
+        # opted out of Kea's built-in global default.
         lease_time = s.get("lease_time")
         try:
             if lease_time:
@@ -246,6 +317,7 @@ def build_subnet4(subnets: list, reservations: list) -> tuple:
     return kea_subnets, applied_count, len(reservations) - applied_count
 
 
+
 class KeaManager:
     """
     Manages Kea DHCP4 via the Kea Control Agent REST API.
@@ -260,44 +332,10 @@ class KeaManager:
         # every time; the shared Session holds the keep-alive connection so
         # back-to-back RPCs reuse it.
         self._session = requests.Session()
-        # Reachability state so a down CA is surfaced ONCE (on transition) and
-        # repeated RPCs short-circuit instead of each stalling for the full
-        # timeout. Cleared on the first successful RPC.
-        self._ca_down = False
-        self._ca_down_since = 0.0
-        self._ca_last_attempt = 0.0
-        self._ca_last_error = ""
 
     # ── Kea Control Agent RPC ─────────────────────────────────────────
 
-    def _mark_ca_up(self) -> None:
-        """Clear the unreachable state; log recovery once on the transition."""
-        if self._ca_down:
-            down_for = time.time() - self._ca_down_since
-            logger.info("Kea CA reachable again at %s (was down %.0fs)",
-                        self.ca_url, down_for)
-        self._ca_down = False
-        self._ca_last_error = ""
-
-    def _mark_ca_down(self, err: str) -> None:
-        """Enter unreachable state; log ONCE on the transition, not per call."""
-        self._ca_last_error = err
-        self._ca_last_attempt = time.time()
-        if not self._ca_down:
-            self._ca_down = True
-            self._ca_down_since = time.time()
-            logger.error("Kea CA unreachable at %s: %s (suppressing repeats "
-                         "until it recovers)", self.ca_url, err)
-
     def _rpc(self, service: str, command: str, args: dict = None) -> dict:
-        # Known-down: short-circuit READ commands within the cooldown so a burst
-        # of reads against a dead CA doesn't each block for the full timeout.
-        # Allow one probe per window through so recovery is detected. Write
-        # commands (config-set / config-write) are NEVER short-circuited — an
-        # operator-initiated write always gets one real attempt.
-        if (command not in _WRITE_COMMANDS and self._ca_down
-                and (time.time() - self._ca_last_attempt) < _CA_DOWN_COOLDOWN):
-            raise RuntimeError(f"Kea CA unreachable: {self._ca_last_error}")
         payload = {"command": command, "service": [service]}
         if args is not None:
             payload["arguments"] = args
@@ -307,22 +345,44 @@ class KeaManager:
             result = r.json()
             if isinstance(result, list):
                 result = result[0]
-            if result.get("result", 0) != 0:
-                # Reached the CA fine — this is a Kea-level error, not a
-                # reachability problem, so don't touch the down-state.
+            code = result.get("result", 0)
+            # Kea's control channel uses result=3 ("empty") for queries that
+            # succeeded but found no matching data — e.g. lease4-get-all on a
+            # subnet with no active leases yet (exactly the case right after
+            # DHCP starts serving again). Treating it as an error made every
+            # diagnostics/list_leases call on an otherwise-healthy, freshly
+            # recovered node fail with a misleading "Kea error" / lease
+            # retrieval failure, even though there was genuinely nothing
+            # wrong — only 1 (error) and 2 (unsupported) are real failures.
+            if code not in (0, 3):
                 raise RuntimeError(result.get("text", "Kea error"))
-            self._mark_ca_up()
             return result.get("arguments", {})
         except requests.RequestException as e:
-            self._mark_ca_down(str(e))
             raise RuntimeError(f"Kea CA unreachable: {e}")
 
     # ── Subnet (scope) management ─────────────────────────────────────
 
     def list_subnets(self) -> list:
+        """Configured subnet4 scopes, straight from the running config.
+
+        Deliberately NOT the ``subnet4-list`` command — that RPC requires
+        ``libdhcp_subnet_cmds.so`` to be loaded, which this install's
+        hooks-libraries does NOT include (only ``lease_cmds`` + ``ha`` are
+        loaded; see kea-dhcp4.conf). Without that hook Kea answers
+        ``result: 2`` ("command not supported"); our own ``_rpc()`` raises
+        on any code other than 0/3, so this used to be silently swallowed by
+        the try/except below, returning an empty list — every caller
+        (get_stats' pool utilization, the WebUI Subnets/Overview tabs,
+        diagnostics' id_to_cidr map) then saw ZERO subnets even though the
+        subnet was correctly synced and actively serving DHCP.
+        ``config-get`` is a core Kea command needing no optional hook, and
+        its ``Dhcp4.subnet4`` array carries the exact same id/subnet/pools/
+        user-context shape build_subnet4() writes — so this sources the
+        identical data the removed RPC would have returned, just from a
+        command guaranteed to exist.
+        """
         try:
-            data = self._rpc("dhcp4", "subnet4-list")
-            return data.get("subnets", [])
+            return self.get_config().get("subnet4", []) or []
         except Exception as e:
             logger.error("list_subnets failed: %s", e)
             return []
@@ -354,6 +414,20 @@ class KeaManager:
             return {"set": True, "written": False, "error": str(e)}
         return {"set": True, "written": True, "error": ""}
 
+    def write_config(self) -> dict:
+        """Retry ``config-write`` alone against the ALREADY-set running config
+        — used by the worker's config-write-permission self-heal, which fixes
+        ``/etc/kea/kea-dhcp4.conf`` on disk and then just needs Kea to persist
+        what it's already running, with no need to re-send/re-validate the
+        whole config via ``config-set``. Returns ``{"written": bool,
+        "error": str}``."""
+        try:
+            self._rpc("dhcp4", "config-write", {})
+        except Exception as e:  # noqa: BLE001
+            return {"written": False, "error": str(e)}
+        return {"written": True, "error": ""}
+
+
     def sync(self, subnets: list, reservations: list) -> dict:
         """
         Full sync: replace all subnets and reservations.
@@ -366,8 +440,7 @@ class KeaManager:
         except Exception as e:
             return {"status": "ERROR", "message": f"Cannot read Kea config: {e}"}
 
-        kea_subnets, reservations_applied, reservations_skipped = build_subnet4(
-            subnets, reservations)
+        kea_subnets, _applied, _skipped = build_subnet4(subnets, reservations)
 
         cfg["subnet4"] = kea_subnets
         try:
@@ -375,16 +448,22 @@ class KeaManager:
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
 
-        logger.info("Synced %d subnets, %d reservations to Kea (%d skipped)",
-                    len(kea_subnets), reservations_applied, reservations_skipped)
-        return {"status": "SUCCESS", "subnets": len(kea_subnets),
-                "reservations": reservations_applied,
-                "reservations_skipped": reservations_skipped}
+        logger.info("Synced %d subnets, %d reservations to Kea", len(kea_subnets), len(reservations))
+        return {"status": "SUCCESS", "subnets": len(kea_subnets), "reservations": len(reservations)}
 
     # ── Lease queries ─────────────────────────────────────────────────
 
     def list_leases(self, subnet: str = None) -> list:
         try:
+            # ``lease4-get-all`` has no "all leases" sentinel value, and per
+            # ISC docs omitting "arguments" entirely is supposed to mean
+            # "every subnet" — but this HA-hooked node rejects a bare/no-args
+            # call with "'subnets' parameter not specified" regardless (the
+            # HA hook likely intercepts lease4-get-all and requires an
+            # explicit subnet list to know which node's view is authoritative
+            # for each one). Always pass "subnets" explicitly: every
+            # currently-configured subnet ID for "all", or the one matching
+            # ``subnet`` when filtering.
             kea_subnets = self.list_subnets()
             ids = [s["id"] for s in kea_subnets if "id" in s]
             if subnet:
@@ -467,7 +546,15 @@ class KeaManager:
 
     def update_reservation(self, old_ip: str, subnet_id: Any, ip: str,
                            mac: str, hostname: str = "") -> dict:
-        """Update a reservation by IP in one config write."""
+        """Update a reservation by IP in ONE config write.
+
+        Previously this deleted the old entry in one ``config-set`` and added
+        the replacement in a second: a failure (or a crash) between the two left
+        the reservation DELETED and never re-created, so the host silently
+        dropped to a dynamic lease. The removal and the insertion are now a
+        single atomic write — either the replacement lands or nothing changes.
+        Reservations still move freely between subnets, because the whole
+        ``subnet4`` block is rewritten in that one write."""
         if not all([subnet_id, ip, mac]):
             return {"status": "ERROR", "message": "subnet_id, ip, and mac are required"}
         cfg = self.get_config()
@@ -546,6 +633,37 @@ class KeaManager:
             return val if isinstance(val, (int, float)) else 0
 
         id_to_cidr = {s.get("id"): s.get("subnet", "") for s in self.list_subnets()}
+        # user-context.description round-trips the NetBox prefix description
+        # (see build_subnet4) — used to label a scope by its real name instead
+        # of the bare "subnet <id>" fallback the UI used previously.
+        id_to_desc = {
+            s.get("id"): ((s.get("user-context") or {}).get("description") or "")
+            for s in self.list_subnets()
+        }
+
+        # Kea's "assigned-addresses" statistic is a counter that only moves on
+        # allocation/explicit release/reclamation events — it is NOT
+        # guaranteed to reflect what's actually in the lease table right now
+        # (e.g. a lease that vanished from lease4-get-all without Kea running
+        # its reclamation timer leaves the counter stuck showing it as still
+        # "assigned"). That drift is exactly what surfaced as "1 assigned
+        # lease" on the Overview tile while the Leases tab — which reads
+        # lease4-get-all directly — showed nothing. Count live, non-expired
+        # leases ourselves so the two tabs can never disagree.
+        assigned_by_subnet = {}
+        try:
+            for lease in self.list_leases():
+                sid = lease.get("subnet-id")
+                if sid is None:
+                    continue
+                # state: 0 = default/active, 1 = declined, 2 = expired-reclaimed.
+                if lease.get("state", 0) not in (0, None):
+                    continue
+                assigned_by_subnet[sid] = assigned_by_subnet.get(sid, 0) + 1
+        except Exception as e:
+            logger.warning("get_stats: live lease count failed, falling back "
+                           "to Kea's assigned-addresses statistic: %s", e)
+            assigned_by_subnet = {}
 
         subnet_ids = set()
         for k in raw:
@@ -553,15 +671,32 @@ class KeaManager:
             if m:
                 subnet_ids.add(int(m.group(1)))
 
+        # Kea does NOT purge statistic-get-all history for a subnet-id that
+        # disappears from subnet4 on a config-set — those samples linger in
+        # the running daemon's memory until it restarts. Before build_subnet4
+        # switched to stable CIDR-derived ids, every NetBox-side reorder/
+        # add/remove reassigned ids and left the OLD id's stats behind
+        # forever as a meaningless "Unknown scope (not in NetBox — stale?)"
+        # 0/0 row. Those ids no longer belong to any currently-configured
+        # subnet — drop them outright instead of rendering a placeholder;
+        # they carry no scope to label and no address pool to report on.
+        stale_ids = subnet_ids - set(id_to_cidr)
+        if stale_ids:
+            logger.info("get_stats: dropping %d orphaned subnet stat id(s) "
+                        "no longer in the live Kea config: %s",
+                        len(stale_ids), sorted(stale_ids))
+        subnet_ids &= set(id_to_cidr)
+
         subnets = []
         for sid in sorted(subnet_ids):
             total    = num(f"subnet[{sid}].total-addresses")
-            assigned = num(f"subnet[{sid}].assigned-addresses")
+            assigned = assigned_by_subnet.get(sid, 0)
             declined = num(f"subnet[{sid}].declined-addresses")
             util = round(assigned / total * 100, 1) if total else 0.0
             subnets.append({
                 "subnet_id":          sid,
                 "subnet":             id_to_cidr.get(sid, ""),
+                "description":        id_to_desc.get(sid, ""),
                 "total_addresses":    total,
                 "assigned_addresses": assigned,
                 "declined_addresses": declined,
@@ -590,27 +725,171 @@ class KeaManager:
             running = True
         except Exception:
             running = False
-        out = {
+        return {
             "running":      running,
             "subnet_count": len(self.list_subnets()) if running else 0,
             "ca_url":       self.ca_url,
         }
-        # Surface WHY it's down so the telemetry card shows an actionable
-        # reason ("Kea CA unreachable at …") instead of a bare "stopped".
-        if not running:
-            out["error"] = (f"Kea CA unreachable at {self.ca_url}"
-                            + (f": {self._ca_last_error}" if self._ca_last_error
-                               else " (is kea-ctrl-agent running?)"))
-        return out
+
+    #: File whose absence/emptiness silently blocks kea-ctrl-agent.service from
+    #: ever starting via its own ConditionFileNotEmpty= gate (see
+    #: install_dhcp.sh) — a fully mechanical, safe-to-recreate condition that
+    #: previously required the operator to notice and manually recreate the
+    #: file (or reinstall the whole role) before Kea's CA would come back.
+    _API_PASSWORD_FILE = "/etc/kea/kea-api-password"
+
+    def _self_heal(self) -> list:
+        """Best-effort, fixed-argv repair of conditions diagnostics() can fully
+        explain and safely fix without operator action — never anything that
+        touches DHCP scope/reservation data. Returns the list of repair
+        actions taken (each a short human-readable string) for the UI/log.
+        """
+        actions = []
+        try:
+            actions.extend(self._heal_api_password_file())
+        except Exception as e:  # noqa: BLE001 — self-heal must never crash diagnostics
+            logger.warning("self-heal (api password) failed: %s", e)
+        try:
+            actions.extend(self._heal_inactive_units())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("self-heal (units) failed: %s", e)
+        try:
+            actions.extend(self._heal_missing_interfaces())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("self-heal (interfaces) failed: %s", e)
+        return actions
+
+    def _heal_api_password_file(self) -> list:
+        path = self._API_PASSWORD_FILE
+        try:
+            needs_create = not os.path.exists(path) or os.path.getsize(path) == 0
+        except OSError:
+            needs_create = True
+        if not needs_create:
+            return []
+        try:
+            with open(path, "wb") as fh:
+                fh.write(base64.b64encode(os.urandom(32)))
+            os.chmod(path, 0o640)
+            try:
+                shutil.chown(path, group="_kea")
+            except (LookupError, PermissionError, OSError):
+                pass  # best-effort, same as the installer
+        except OSError as e:
+            logger.warning("could not recreate %s: %s", path, e)
+            return []
+        logger.info("self-heal: recreated missing/empty %s", path)
+        return [f"recreated missing {path}"]
+
+    def _heal_inactive_units(self) -> list:
+        """Restart kea-dhcp4-server/kea-ctrl-agent if systemd reports them
+        failed/inactive-but-enabled. A crash-looped or one-off-killed unit is
+        exactly the case an uninstall/reinstall used to be needed to clear —
+        ``systemctl restart`` is the same fixed, argument-free recovery a
+        reinstall ultimately performs, without touching any configuration.
+        """
+        actions = []
+        for unit in ("kea-dhcp4-server", "kea-ctrl-agent"):
+            state = self._unit_status(unit)
+            active = state.get("ActiveState")
+            load = state.get("LoadState")
+            if load != "loaded" or active == "active":
+                continue
+            if active not in ("failed", "inactive"):
+                continue
+            result = self._run_diag(["systemctl", "restart", unit], timeout=20)
+            if result["ok"]:
+                actions.append(f"restarted {unit} (was {active})")
+                logger.info("self-heal: restarted %s (was %s)", unit, active)
+            else:
+                logger.warning(
+                    "self-heal: restart of %s failed: %s", unit, result["error"])
+        return actions
+
+    def _heal_missing_interfaces(self) -> list:
+        """Set ``interfaces-config.interfaces`` when it is empty.
+
+        ``interfaces-config`` is node-owned (see ``build_node_config`` /
+        ``COORDINATOR_OWNED_KEYS`` in ``kea_ha.py``) — the LM sync path never
+        touches it, and the stock Debian ``kea-dhcp4-server`` package ships it
+        as ``[]`` ("listen on nothing") with a comment telling the operator to
+        fill it in by hand. Nothing in ``install_dhcp.sh`` ever did, so a node
+        can run for a long time looking completely healthy — service active,
+        HA heartbeats fine, control agent answering, config-get fine — while
+        Kea has never actually opened a DHCPv4 socket and every real client is
+        silently getting no offer at all. This is exactly the case behind the
+        "Nothing is listening on DHCP server port UDP/67" recommendation.
+
+        Heals by setting ``interfaces`` to ``["*"]`` — listen on every
+        interface, the same safe default an operator would type by hand — via
+        ``config-set``/``config-write``, then restarting the daemon: Kea's
+        DHCPv4 socket set is bound once at startup, so a ``config-set`` alone
+        (no restart) updates the on-disk/running JSON but does not open the
+        new listener until the process restarts.
+        """
+        try:
+            config = self.get_config()
+        except Exception as e:
+            logger.warning("self-heal (interfaces): could not read config: %s", e)
+            # Surface the failure instead of silently returning [] — a caller
+            # reading "no self-heal actions" has no way to tell "nothing
+            # needed fixing" apart from "the heal itself couldn't even check",
+            # which is exactly the ambiguity that let this stay broken.
+            return [f"could not check interfaces-config: {e}"]
+        raw_interfaces = ((config.get("interfaces-config", {}) or {})
+                          .get("interfaces", []) or [])
+        # Filter out blank/whitespace-only entries — Kea's config-get has been
+        # observed to echo an "empty" interfaces list back as ``[""]`` rather
+        # than ``[]``, which is still falsy/non-listening but IS a non-empty
+        # Python list, so a plain truthiness check would wrongly treat it as
+        # "already configured" and silently skip healing (matches the same
+        # stricter filtering diagnostics() already applies below).
+        interfaces = [v for v in raw_interfaces if str(v).strip()]
+        if interfaces:
+            return []
+        new_config = copy.deepcopy(config)
+        new_config.setdefault("interfaces-config", {})["interfaces"] = ["*"]
+        try:
+            result = self.apply_config(new_config)
+        except Exception as e:
+            logger.warning("self-heal (interfaces): apply failed: %s", e)
+            return [f"failed to set interfaces-config: {e}"]
+        if not (result.get("set") and result.get("written")):
+            logger.warning("self-heal (interfaces): apply did not succeed: %s", result)
+            return [f"could not set interfaces-config: "
+                    f"{result.get('error') or 'config-set/config-write did not report success'}"]
+        restart = self._run_diag(["systemctl", "restart", "kea-dhcp4-server"], timeout=20)
+        if not restart["ok"]:
+            logger.warning(
+                "self-heal (interfaces): config updated but restart failed: %s",
+                restart["error"])
+            return ["set interfaces-config to listen on all interfaces "
+                    "(restart failed — apply manually with systemctl restart "
+                    "kea-dhcp4-server)"]
+        logger.info(
+            "self-heal: interfaces-config was empty (Kea was listening on "
+            "nothing); set to listen on all interfaces and restarted "
+            "kea-dhcp4-server")
+        return ["set interfaces-config to listen on all interfaces "
+                "(was empty) and restarted kea-dhcp4-server"]
 
     def diagnostics(self) -> dict:
         """Return Kea service, config, interface, listener, CA, and lease checks."""
+        repairs = self._self_heal()
         units = {
             name: self._unit_status(name)
             for name in ("kea-dhcp4-server", "kea-ctrl-agent")
         }
         config_test = self._run_diag(
             ["kea-dhcp4", "-t", "/etc/kea/kea-dhcp4.conf"], timeout=10)
+        # The control agent has its OWN config file (kea-ctrl-agent.conf) and
+        # its own syntax-check binary invocation. A "Control Agent is not
+        # active" recommendation with no further detail forced a manual SSH
+        # to find out WHY — this test + the dedicated journal tail below give
+        # the actual failure reason (bad JSON, socket path, port already
+        # bound, etc.) directly in the diagnostics panel.
+        ca_config_test = self._run_diag(
+            ["kea-ctrl-agent", "-t", "/etc/kea/kea-ctrl-agent.conf"], timeout=10)
         sockets = self._run_diag(["ss", "-H", "-lntup"])
         if not sockets["ok"]:
             sockets = self._run_diag(["ss", "-H", "-lntu"])
@@ -641,8 +920,19 @@ class KeaManager:
             except Exception as e:
                 ca["error"] = str(e)
             try:
+                # Always pass "subnets" explicitly — per ISC docs, omitting
+                # "arguments" entirely means "every subnet", but this
+                # HA-hooked node rejects a bare/no-args call with
+                # "'subnets' parameter not specified" regardless (the HA hook
+                # likely intercepts lease4-get-all and requires an explicit
+                # subnet list to know which node's view is authoritative for
+                # each one). Reuse the subnet4 IDs from the config already
+                # fetched above rather than a second config-get/subnet4-list
+                # round trip.
+                subnet_ids = [s["id"] for s in (config.get("subnet4", []) or [])
+                              if "id" in s]
                 lease_data = self._rpc(
-                    "dhcp4", "lease4-get-all", {"subnet-id": 0})
+                    "dhcp4", "lease4-get-all", {"subnets": subnet_ids})
                 leases = lease_data.get("leases", [])
             except Exception as e:
                 if not ca["error"]:
@@ -673,14 +963,43 @@ class KeaManager:
             line for line in recent["output"].splitlines()
             if line.strip() and "-- No entries --" not in line
         ][-20:]
+        # kea-ctrl-agent's OWN tail, unfiltered by priority. When the CA unit
+        # itself never came up (crash-looped, port already bound, bad JSON in
+        # kea-ctrl-agent.conf), the failure is usually logged at "info"/"err"
+        # around process exit — the combined "-p warning" tail above can miss
+        # it entirely if kea-dhcp4-server is chattier. This is what actually
+        # answers "why is Control Agent FAIL / connection refused".
+        ca_recent = self._run_diag([
+            "journalctl", "-u", "kea-ctrl-agent", "-n", "20",
+            "--no-pager", "-o", "cat",
+        ])
+        ca_recent_errors = [
+            line for line in ca_recent["output"].splitlines()
+            if line.strip() and "-- No entries --" not in line
+        ][-20:]
 
         recommendations = []
+        for action in repairs:
+            recommendations.append(f"Self-healed: {action}. Re-checking findings above.")
         if units["kea-dhcp4-server"].get("ActiveState") != "active":
             recommendations.append(
                 "Kea DHCP4 is not active; inspect its service status and recent log.")
-        if units["kea-ctrl-agent"].get("ActiveState") != "active":
+        ca_unit = units["kea-ctrl-agent"]
+        if ca_unit.get("ActiveState") != "active":
+            detail = (
+                f" (exit status {ca_unit['ExecMainStatus']})"
+                if ca_unit.get("ExecMainStatus") not in (None, "", "0") else "")
             recommendations.append(
-                "Kea Control Agent is not active; the LM DHCP module cannot manage Kea.")
+                "Kea Control Agent is not active; the LM DHCP module cannot "
+                f"manage Kea{detail}.")
+            if not ca_config_test["ok"]:
+                recommendations.append(
+                    "kea-ctrl-agent.conf failed its own syntax check: "
+                    + (ca_config_test["error"] or ca_config_test["output"]
+                       or "see config_test output").strip()[:300])
+            elif ca_recent_errors:
+                recommendations.append(
+                    "kea-ctrl-agent recent log: " + ca_recent_errors[-1][:300])
         if not config_test["ok"]:
             recommendations.append(
                 "Kea configuration validation failed; fix the reported config error.")
@@ -714,9 +1033,13 @@ class KeaManager:
         return {
             "status": "SUCCESS",
             "healthy": healthy,
+            "worker_code_version": worker_code_version(),
+            "self_healed": repairs,
             "units": units,
             "ca": ca,
             "config_test": config_test,
+            "ca_config_test": ca_config_test,
+            "ca_recent_errors": ca_recent_errors,
             "interfaces_configured": interfaces,
             "interface_missing": missing_interfaces,
             "subnets": [
