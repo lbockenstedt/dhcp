@@ -239,13 +239,11 @@ class KeaManager:
 
     def list_leases(self, subnet: str = None) -> list:
         try:
-            args = {"subnet-id": 0}  # 0 = all
+            kea_subnets = self.list_subnets()
+            ids = [s["id"] for s in kea_subnets if "id" in s]
             if subnet:
-                for s in self.list_subnets():
-                    if s.get("subnet") == subnet:
-                        args["subnet-id"] = s["id"]
-                        break
-            data = self._rpc("dhcp4", "lease4-get-all", args)
+                ids = [s["id"] for s in kea_subnets if s.get("subnet") == subnet]
+            data = self._rpc("dhcp4", "lease4-get-all", {"subnets": ids})
             return data.get("leases", [])
         except Exception as e:
             logger.error("list_leases failed: %s", e)
