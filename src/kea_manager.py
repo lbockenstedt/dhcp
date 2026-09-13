@@ -178,6 +178,7 @@ def build_subnet4(subnets: list, reservations: list) -> tuple:
             "subnet": str(net),
             "pools":  pools,
             "option-data": [],
+            "reservations-lookup-first": True,
         }
         description = (s.get("description") or "").strip()
         if description:
