@@ -682,7 +682,15 @@ class DHCPSpoke(BaseSpoke):
         the second silently discard the first.
         """
         action = "delete" if cmd == "DHCP_DEL_RES" else "upsert"
-        return await self.cluster.mutate_reservation(action, data)
+        res = await self.cluster.mutate_reservation(action, data)
+        if res.get("status") == "SUCCESS" and action != "delete":
+            old_ip = data.get("old_ip") or data.get("ip")
+            if old_ip:
+                try:
+                    await self.cluster.transport.fanout("KEAW_DEL_LEASE", {"ip": old_ip})
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("Failed to purge old lease %s: %s", old_ip, e)
+        return res
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch a hub command to the Kea manager.
@@ -743,6 +751,12 @@ class DHCPSpoke(BaseSpoke):
             if cmd == "DHCP_LIST_LEASES":
                 return await self._ha_list("KEAW_LIST_LEASES",
                                            {"subnet": data.get("subnet")}, "leases")
+            if cmd == "DHCP_DEL_LEASE":
+                ip = data.get("ip") or data.get("ip-address")
+                if not ip:
+                    return {"status": "ERROR", "message": "ip is required"}
+                fan = await self.cluster.transport.fanout("KEAW_DEL_LEASE", {"ip": ip})
+                return {"status": "SUCCESS", "results": fan.get("results", {})}
             if cmd == "DHCP_LIST_RES":
                 return await self._ha_list("KEAW_LIST_RES", {}, "reservations")
             if cmd == "DHCP_DIAGNOSTICS":
@@ -781,6 +795,12 @@ class DHCPSpoke(BaseSpoke):
             subnet = data.get("subnet")
             leases = await asyncio.to_thread(self.mgr.list_leases, subnet)
             return {"status": "SUCCESS", "leases": leases}
+
+        if cmd == "DHCP_DEL_LEASE":
+            ip = data.get("ip") or data.get("ip-address")
+            if not ip:
+                return {"status": "ERROR", "message": "ip is required"}
+            return await asyncio.to_thread(self.mgr.delete_lease, ip)
 
         if cmd == "DHCP_ADD_RES":
             subnet_id = data.get("subnet_id")

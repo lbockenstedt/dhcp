@@ -43,6 +43,7 @@ DHCP_WORKER_OPS = (
     "KEAW_LIST_SUBNETS",   # subnet4-list
     "KEAW_LIST_LEASES",    # lease4-get-all
     "KEAW_LIST_RES",       # static reservations across subnets
+    "KEAW_DEL_LEASE",      # delete active lease by IP
     "KEAW_DIAGNOSTICS",    # full local diagnostics evidence
     "KEAW_STATS",          # statistic-get-all
 )
