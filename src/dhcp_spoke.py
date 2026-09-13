@@ -12,27 +12,15 @@ try:
 except ImportError:
     from core.src.base_spoke import BaseSpoke
 
-try:
-    from kea_manager import KeaManager
-except ImportError:  # loaded as a package (src.X) by the sibling entrypoint
-    from src.kea_manager import KeaManager
+from kea_manager import KeaManager
 
-try:
-    from kea_ha import (
-        DEFAULT_CLUSTER_CONFIG, DEFAULT_DESIRED_STATE, DHCP_WORKER_OPS,
-        KeaHAConfigError, UnsupportedHAMode, build_peers, load_cluster_config,
-        normalize_mode, save_cluster_config,
-    )
-    from kea_cluster import KeaHACoordinator
-    from ha_pki import issue_member_material
-except ImportError:  # loaded as a package (src.X) by the sibling entrypoint
-    from src.kea_ha import (  # type: ignore
-        DEFAULT_CLUSTER_CONFIG, DEFAULT_DESIRED_STATE, DHCP_WORKER_OPS,
-        KeaHAConfigError, UnsupportedHAMode, build_peers, load_cluster_config,
-        normalize_mode, save_cluster_config,
-    )
-    from src.kea_cluster import KeaHACoordinator  # type: ignore
-    from src.ha_pki import issue_member_material  # type: ignore
+from kea_ha import (
+    DEFAULT_CLUSTER_CONFIG, DEFAULT_DESIRED_STATE, DHCP_WORKER_OPS,
+    KeaHAConfigError, UnsupportedHAMode, build_peers, load_cluster_config,
+    normalize_mode, save_cluster_config,
+)
+from kea_cluster import KeaHACoordinator
+from ha_pki import issue_member_material
 
 logger = logging.getLogger("DHCPSpoke")
 
@@ -128,17 +116,13 @@ class DHCPSpoke(BaseSpoke):
       behaves exactly as before.
 
     Commands:
-      GET_VERSION        — spoke/version string
-      DHCP_SYNC          — replace all subnets + reservations from NetBox data
-      DHCP_LIST_SUBNETS  — list all managed subnets
-      DHCP_LIST_LEASES   — list active leases (optional subnet CIDR filter)
-      DHCP_LIST_RES      — list all static reservations across subnets
-      DHCP_ADD_RES       — add a static reservation (ip+mac+subnet_id required)
-      DHCP_UPDATE_RES    — replace a reservation (delete-then-add, non-atomic)
-      DHCP_DEL_RES       — remove a static reservation by IP
-      DHCP_STATUS        — Kea health + subnet count
-      DHCP_STATS         — statistic-get-all pool utilization + packet counters
-      DHCP_DIAGNOSTICS   — service/config/interface/listener/lease evidence
+      DHCP_SYNC         — replace all subnets + reservations from NetBox data
+      DHCP_LIST_SUBNETS — list all managed subnets
+      DHCP_LIST_LEASES  — list active leases (optional subnet filter)
+      DHCP_ADD_RES      — add a static reservation
+      DHCP_DEL_RES      — remove a static reservation by IP
+      DHCP_STATUS       — Kea health + subnet count
+      DHCP_DIAGNOSTICS  — service/config/interface/listener/lease evidence
       DHCP_HA_STATUS     — HA member state, lease sync, drift, recommendations
       DHCP_HA_CONFIG     — set the HA member pair + mode (+ worker secret)
       DHCP_HA_APPLY      — re-apply the current desired config to both nodes
@@ -619,7 +603,13 @@ class DHCPSpoke(BaseSpoke):
                   "declined_addresses": 0, "pkt4_received": 0,
                   "pkt4_discover": 0, "pkt4_request": 0, "pkt4_offer_sent": 0,
                   "pkt4_ack_sent": 0, "pkt4_nak_sent": 0}
-        subnets: List[Dict[str, Any]] = []
+        # Both HA nodes serve the identical subnet4 config, so every member
+        # reports the SAME subnets back — collect per-subnet numbers keyed by
+        # subnet_id (falling back to the CIDR) and average them below rather
+        # than blindly appending each member's copy, which used to render
+        # every scope twice in the Overview tab (one row per node).
+        subnet_totals: Dict[Any, Dict[str, Any]] = {}
+        subnet_hits: Dict[Any, int] = {}
         for member_id, reply in (fan.get("results") or {}).items():
             per_member[member_id] = reply
             if not isinstance(reply, dict) or reply.get("status") != "SUCCESS":
@@ -628,7 +618,26 @@ class DHCPSpoke(BaseSpoke):
             for key in totals:
                 totals[key] += int(g.get(key) or 0)
             for sub in reply.get("subnets") or []:
-                subnets.append({**sub, "member_id": member_id})
+                key = sub.get("subnet_id", sub.get("subnet"))
+                if key not in subnet_totals:
+                    subnet_totals[key] = dict(sub)
+                    subnet_hits[key] = 1
+                else:
+                    subnet_hits[key] += 1
+                    for num_key in ("total_addresses", "assigned_addresses",
+                                    "declined_addresses"):
+                        subnet_totals[key][num_key] = (
+                            subnet_totals[key].get(num_key, 0) + sub.get(num_key, 0))
+        subnets: List[Dict[str, Any]] = []
+        for key, sub in subnet_totals.items():
+            hits = max(1, subnet_hits[key])
+            for num_key in ("total_addresses", "assigned_addresses", "declined_addresses"):
+                sub[num_key] = sub.get(num_key, 0) // hits
+            sub["utilization_pct"] = (
+                round(sub["assigned_addresses"] / sub["total_addresses"] * 100, 1)
+                if sub.get("total_addresses") else 0.0)
+            subnets.append(sub)
+        subnets.sort(key=lambda s: s.get("subnet_id") if s.get("subnet_id") is not None else 0)
         # Pool capacity is the SAME address space on both nodes — summing it
         # would double-count. Report one node's view of capacity/usage.
         node_count = max(1, sum(1 for r in per_member.values()
@@ -696,15 +705,6 @@ class DHCPSpoke(BaseSpoke):
         return res
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Dispatch a hub command to the Kea manager.
-
-        Every ``KeaManager`` call is offloaded to a worker thread via
-        ``asyncio.to_thread``: the Kea Control Agent speaks sync HTTP
-        (``requests``) and ``DHCP_SYNC`` chains 3–4 RPCs, while this role
-        shares one event loop with the dns + base role sub-spokes — a slow
-        or hung Kea CA would otherwise block every in-flight request across
-        all three sub-spokes.
-        """
         cmd = command_type.upper()
 
         if cmd == "GET_VERSION":
@@ -872,18 +872,13 @@ class DHCPSpoke(BaseSpoke):
                 "status": "HEALTHY" if report["healthy"] else "DEGRADED",
             }
         s = await asyncio.to_thread(self.mgr.status)
-        out = {
+        return {
             "spoke_id":     self.spoke_id,
             "module":       "dhcp",
             "kea":          "running" if s["running"] else "stopped",
             "subnet_count": s["subnet_count"],
             "status":       "HEALTHY" if s["running"] else "DEGRADED",
         }
-        # Carry the reason for a down CA into the telemetry frame so the hub
-        # surfaces it (single, deduped) instead of just "stopped".
-        if s.get("error"):
-            out["error"] = s["error"]
-        return out
 
     def get_version(self) -> str:
         from pathlib import Path
