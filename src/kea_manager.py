@@ -498,7 +498,10 @@ class KeaManager:
                         self.delete_lease(l_ip)
                         purged.append(l_ip)
             except Exception as e:
-                logger.debug("purge_leases_for_mac_or_ip failed: %s", e)
+                # A surviving lease means the client keeps its current address
+                # and never picks up the reservation, so this must not stay a
+                # debug-level detail.
+                logger.warning("Could not purge leases for %s: %s", norm_mac, e)
         return purged
 
     # ── Manual reservation CRUD ───────────────────────────────────────
@@ -518,8 +521,8 @@ class KeaManager:
         else:
             return {"status": "ERROR", "message": f"Subnet {subnet_id} not found"}
         self._set_config(cfg)
-        self.purge_leases_for_mac_or_ip(mac=norm_mac, ip=ip)
-        return {"status": "SUCCESS"}
+        purged = self.purge_leases_for_mac_or_ip(mac=norm_mac, ip=ip)
+        return {"status": "SUCCESS", "lease_purge": {"purged": purged}}
 
     def list_reservations(self) -> list:
         """Return all static reservations across subnets."""
@@ -573,12 +576,12 @@ class KeaManager:
         })
         try:
             self._set_config(cfg)
-            self.purge_leases_for_mac_or_ip(mac=norm_mac, ip=ip)
+            purged = self.purge_leases_for_mac_or_ip(mac=norm_mac, ip=ip)
             if old_ip and old_ip != ip:
-                self.purge_leases_for_mac_or_ip(ip=old_ip)
+                purged += self.purge_leases_for_mac_or_ip(ip=old_ip)
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
-        return {"status": "SUCCESS"}
+        return {"status": "SUCCESS", "lease_purge": {"purged": purged}}
 
     def delete_reservation(self, ip: str) -> dict:
         cfg = self.get_config()

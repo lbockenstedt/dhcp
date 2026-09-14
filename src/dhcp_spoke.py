@@ -692,17 +692,59 @@ class DHCPSpoke(BaseSpoke):
         """
         action = "delete" if cmd == "DHCP_DEL_RES" else "upsert"
         res = await self.cluster.mutate_reservation(action, data)
-        if res.get("status") == "SUCCESS" and action != "delete":
-            ip = data.get("ip")
-            old_ip = data.get("old_ip")
-            mac = data.get("mac")
-            try:
-                await self.cluster.transport.fanout("KEAW_DEL_LEASE", {"ip": ip, "old_ip": old_ip, "mac": mac})
-                if old_ip and old_ip != ip:
-                    await self.cluster.transport.fanout("KEAW_DEL_LEASE", {"ip": old_ip, "mac": mac})
-            except Exception as e:  # noqa: BLE001
-                logger.debug("Failed to purge old lease for %s / %s: %s", mac, ip, e)
+        if res.get("status") != "SUCCESS" or action == "delete":
+            return res
+
+        ip = data.get("ip")
+        old_ip = data.get("old_ip")
+        mac = data.get("mac")
+        try:
+            purged, errors = await self._purge_client_leases(ip, old_ip, mac)
+        except Exception as e:  # noqa: BLE001
+            purged, errors = [], {"coordinator": str(e)}
+        res["lease_purge"] = {"purged": purged, "errors": errors}
+        if errors:
+            # Writing the reservation is only half the job: while the client
+            # still holds its OLD lease it keeps using that address and never
+            # moves to the reserved one, so the operator sees a reservation
+            # that "did nothing". Downgrading to PARTIAL (instead of reporting
+            # a clean SUCCESS) is what surfaces that in the UI.
+            logger.warning(
+                "Reservation for %s applied, but the previous lease (%s) could "
+                "not be purged on %s: %s",
+                ip, old_ip or ip, ", ".join(sorted(errors)), errors)
+            res["status"] = "PARTIAL"
+            res["message"] = (
+                f"Reservation for {ip} applied, but the previous lease "
+                f"({old_ip or ip}) could not be removed on "
+                f"{', '.join(sorted(errors))}. The client will keep its "
+                f"current address until that lease expires.")
         return res
+
+    async def _purge_client_leases(self, ip, old_ip, mac):
+        """Drop the client's existing lease(s) on EVERY node of the pair.
+
+        One fanout covers all of them: the worker's ``KEAW_DEL_LEASE`` purges
+        the new IP, the old IP and every lease held by ``mac`` (a client that
+        previously answered on a different address still has to be moved).
+
+        The result used to be discarded and the exception swallowed at debug
+        level, so a node that was disconnected — which ``fanout`` counts as
+        FAILED — left a live lease behind with nothing logged anywhere.
+        Returns ``(purged, errors)``.
+        """
+        reply = await self.cluster.transport.fanout(
+            "KEAW_DEL_LEASE", {"ip": ip, "old_ip": old_ip, "mac": mac})
+        purged, errors = set(), {}
+        for member_id, r in (reply.get("results") or {}).items():
+            r = r if isinstance(r, dict) else {}
+            if r.get("status") == "SUCCESS":
+                purged.update(r.get("purged") or [])
+            else:
+                errors[member_id] = r.get("message") or "lease purge failed"
+        if not reply.get("results"):
+            errors["cluster"] = reply.get("message") or "no node answered the lease purge"
+        return sorted(purged), errors
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         cmd = command_type.upper()
