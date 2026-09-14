@@ -254,7 +254,6 @@ def build_subnet4(subnets: list, reservations: list) -> tuple:
             "pools":  pools,
             "option-data": [],
             "reservations-lookup-first": True,
-            "reservation-mode": "all",
         }
         # Carry the NetBox prefix description through in Kea's user-context so
         # the UI can label a scope by its real name/purpose instead of a bare
@@ -511,7 +510,6 @@ class KeaManager:
         for sub in cfg.get("subnet4", []):
             if str(sub.get("id")) == str(subnet_id):
                 sub["reservations-lookup-first"] = True
-                sub["reservation-mode"] = "all"
                 sub.setdefault("reservations", [])
                 sub["reservations"].append({
                     "ip-address": ip,
@@ -564,7 +562,6 @@ class KeaManager:
             if str(sub.get("id")) == str(subnet_id):
                 target = sub
                 sub["reservations-lookup-first"] = True
-                sub["reservation-mode"] = "all"
             sub["reservations"] = [
                 r for r in sub.get("reservations", [])
                 if r.get("ip-address") != old_ip
