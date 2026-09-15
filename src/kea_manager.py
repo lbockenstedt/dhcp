@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import requests
 import ipaddress
 import os
+import pwd
 import shutil
 import subprocess
 import zlib
@@ -754,6 +755,10 @@ class KeaManager:
             actions.extend(self._heal_missing_interfaces())
         except Exception as e:  # noqa: BLE001
             logger.warning("self-heal (interfaces) failed: %s", e)
+        try:
+            actions.extend(self._heal_control_socket_ownership())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("self-heal (control socket) failed: %s", e)
         return actions
 
     def _heal_api_password_file(self) -> list:
@@ -869,6 +874,99 @@ class KeaManager:
             "kea-dhcp4-server")
         return ["set interfaces-config to listen on all interfaces "
                 "(was empty) and restarted kea-dhcp4-server"]
+
+    #: Kea's control socket, and the runtime directory holding it. Both units
+    #: declare ``RuntimeDirectory=kea`` with ``User=_kea``, so systemd
+    #: re-creates and re-chowns the directory on every start — which is what
+    #: makes a plain restart a complete, data-safe repair for a hijacked one.
+    _CTRL_SOCKET_DEFAULT = "/run/kea/kea4-ctrl-socket"
+
+    def _config_ctrl_socket_path(self) -> str:
+        """The dhcp4 control socket path, read from the ON-DISK config.
+
+        Deliberately not via ``get_config()``: reaching the config means
+        talking to the control agent through the very socket this check
+        exists to validate, so the RPC is exactly what fails when there is
+        something to heal.
+        """
+        try:
+            with open("/etc/kea/kea-dhcp4.conf", "r") as fh:
+                raw = fh.read()
+        except OSError:
+            return self._CTRL_SOCKET_DEFAULT
+        m = re.search(r'"socket-name"\s*:\s*"([^"]+)"', raw)
+        return m.group(1) if m else self._CTRL_SOCKET_DEFAULT
+
+    def _heal_control_socket_ownership(self) -> list:
+        """Restart Kea when its runtime dir/control socket is owned by someone
+        other than the user the daemons actually run as.
+
+        Kea's runtime directory is SHARED by name (``/run/kea``). Anything
+        else that starts a Kea as root — notably a co-located ``-sim`` stack —
+        creates it first, as ``root:root 0750``. ``kea-dhcp4-server`` and
+        ``kea-ctrl-agent`` run as ``_kea`` and then cannot even traverse their
+        own runtime directory, so every ``config-get``/``config-set`` the hub
+        issues comes back as ``"unable to forward command to the dhcp4
+        service: Permission denied. The server is likely to be offline"``.
+
+        This was invisible to ``_heal_inactive_units``, which only restarts
+        units systemd reports as failed/inactive: BOTH units stay perfectly
+        ``active`` here — they are running, they are just locked out of their
+        own socket. The whole DHCP cluster silently contributes nothing to the
+        hub (no subnets, no reservations, no leases) while looking healthy in
+        systemd, and the sync's reservation apply fails at ``read-config``.
+
+        Restarting is the complete fix precisely because ``RuntimeDirectory=``
+        makes systemd re-create and re-chown the directory for the unit's own
+        ``User=``. No configuration and no lease/reservation data is touched.
+        """
+        socket_path = self._config_ctrl_socket_path()
+        run_dir = os.path.dirname(socket_path) or "/run/kea"
+        try:
+            want_uid = pwd.getpwnam("_kea").pw_uid
+        except KeyError:
+            return []  # not a packaged/_kea install — nothing to reason about
+        offenders = []
+        for path in (run_dir, socket_path):
+            try:
+                if os.stat(path).st_uid != want_uid:
+                    offenders.append(path)
+            except OSError:
+                continue  # absent is _heal_inactive_units' problem, not ours
+        if not offenders:
+            return []
+        logger.warning(
+            "self-heal: %s not owned by _kea — Kea is locked out of its own "
+            "control socket; restarting so systemd re-chowns RuntimeDirectory",
+            ", ".join(offenders))
+        actions = []
+        # dhcp4 first: it owns the socket the control agent connects to, so
+        # restarting the CA first would only have it reconnect to the stale,
+        # still-misowned socket.
+        for unit in ("kea-dhcp4-server", "kea-ctrl-agent"):
+            result = self._run_diag(["systemctl", "restart", unit], timeout=20)
+            if not result["ok"]:
+                logger.warning("self-heal: restart of %s failed: %s",
+                               unit, result["error"])
+                actions.append(f"failed to restart {unit}: {result['error']}")
+                return actions
+            actions.append(f"restarted {unit}")
+        still_wrong = []
+        for path in offenders:
+            try:
+                if os.stat(path).st_uid != want_uid:
+                    still_wrong.append(path)
+            except OSError:
+                still_wrong.append(path)
+        if still_wrong:
+            # Say so rather than reporting a clean repair — the usual cause is
+            # the root-owned process that took the directory still running and
+            # re-creating it, which needs an operator.
+            return [f"restarted Kea but {', '.join(still_wrong)} is still not "
+                    f"owned by _kea (something else running as root is "
+                    f"re-creating {run_dir})"]
+        return [f"restarted Kea: {', '.join(offenders)} was not owned by _kea "
+                f"(control socket was unreachable)"]
 
     def diagnostics(self) -> dict:
         """Return Kea service, config, interface, listener, CA, and lease checks."""
