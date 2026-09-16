@@ -581,7 +581,9 @@ class KeaHACoordinator:
             peers = self.peers()
         except KeaHAConfigError as e:
             return {"enabled": True, "mode": self.mode, "state": "invalid",
-                    "healthy": False, "config_converged": False,
+                    "healthy": False, "updating": False, "updating_members": [],
+                    "serving": False, "serving_count": 0,
+                    "config_converged": False,
                     "config_digests_missing": [m["id"] for m in self.members()],
                     "peers": [], "members": [], "member_count": len(self.members()),
                     "healthy_count": 0, "degraded": [], "unreachable": [],
@@ -597,7 +599,11 @@ class KeaHACoordinator:
                 "started_at": self.pending_candidate.get("started_at"),
             }
             report["healthy"] = False
-            if report["state"] == "healthy":
+            # An unconfirmed journalled config is a REAL fault (the coordinator
+            # died mid-apply), not the benign mid-apply window — so it must
+            # also clear "updating", which would otherwise excuse it.
+            report["updating"] = False
+            if report["state"] in ("healthy", "updating"):
                 report["state"] = "degraded"
             unrestored = self.pending_candidate.get("unrestored") or []
             report["pending_candidate"]["unrestored"] = list(unrestored)
