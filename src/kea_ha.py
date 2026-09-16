@@ -26,6 +26,7 @@ import copy
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger("KeaHA")
@@ -392,6 +393,31 @@ def config_fingerprint(dhcp4: Dict[str, Any]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+#: Kea HA states a node passes through while it re-reads its configuration and
+#: re-synchronises leases. Kea DELIBERATELY takes the node out of service for
+#: the whole of this window (``HA_LOCAL_DHCP_DISABLE ... while in the WAITING
+#: state``) and only re-enables it on reaching a serving state. Observed on a
+#: live pair: WAITING 10s -> SYNCING -> READY -> HOT-STANDBY at +31s, all
+#: inside ONE kea-dhcp4 process (no restart) -- a ``config-set`` re-initialises
+#: the HA hook, which is what a NetBox sync does on every changed push.
+#:
+#: This is a normal phase of applying configuration, NOT a fault, and must be
+#: reported as such: classifying it as "degraded" made every routine sync look
+#: like a two-node outage.
+TRANSITIONAL_HA_STATES = ("waiting", "syncing", "ready")
+
+#: States in which the node is actually answering DHCP clients. ``partner-down``
+#: is included: the node has taken over the full scope and IS serving, even
+#: though the pair is not in sync.
+SERVING_HA_STATES = ("hot-standby", "load-balancing", "partner-down")
+
+#: How long after an apply a transitional node is still credibly "updating".
+#: Comfortably over the ~31s a real pair takes, but short enough that a node
+#: genuinely STUCK in WAITING (partner never came back) stops being excused and
+#: escalates to degraded.
+APPLY_SETTLE_S = 180.0
+
+
 def parse_ha_status(status_get: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize Kea ``status-get`` into the HA fields the UI needs.
 
@@ -402,7 +428,8 @@ def parse_ha_status(status_get: Dict[str, Any]) -> Dict[str, Any]:
     ha_list = (status_get or {}).get("high-availability") or []
     if not ha_list:
         return {"ha_enabled": False, "local": {}, "remote": {},
-                "state": "not-configured", "scopes": [], "in_sync": False}
+                "state": "not-configured", "scopes": [], "in_sync": False,
+                "transitional": False, "serving": False}
     servers = (ha_list[0] or {}).get("ha-servers") or {}
     local = servers.get("local") or {}
     remote = servers.get("remote") or {}
@@ -426,9 +453,15 @@ def parse_ha_status(status_get: Dict[str, Any]) -> Dict[str, Any]:
         "unacked_clients": remote.get("unacked-clients"),
         "in_sync": bool(in_touch and state in ("hot-standby", "load-balancing")
                         and remote_state in ("hot-standby", "load-balancing")),
+        # Applying configuration / re-syncing leases — expected, self-clearing,
+        # and NOT a fault. Kept separate from in_sync so no existing caller's
+        # meaning changes.
+        "transitional": state in TRANSITIONAL_HA_STATES,
+        "serving": state in SERVING_HA_STATES,
         "local": local,
         "remote": remote,
     }
+
 
 
 def public_peers(peers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -451,16 +484,28 @@ def summarize_ha(mode: str, peers: List[Dict[str, Any]],
                  links: List[Dict[str, Any]],
                  per_member: Dict[str, Dict[str, Any]],
                  config_digests: Optional[Dict[str, str]] = None,
-                 last_apply: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                 last_apply: Optional[Dict[str, Any]] = None,
+                 now: Optional[float] = None) -> Dict[str, Any]:
     """Cluster/member stats, drift, partial failures and recommendations.
 
     Pure — the Diagnostics page renders exactly this, and every branch is
-    directly testable.
+    directly testable. ``now`` is injectable purely so the "is this pair
+    mid-apply?" window is testable without sleeping.
     """
     config_digests = config_digests or {}
+    now = time.time() if now is None else now
+    # An apply that landed within APPLY_SETTLE_S explains a node still walking
+    # WAITING -> SYNCING -> READY. Outside that window a transitional node is
+    # STUCK, not updating, and must not be excused.
+    applied_at = (last_apply or {}).get("at")
+    try:
+        recent_apply = applied_at is not None and 0 <= (now - float(applied_at)) <= APPLY_SETTLE_S
+    except (TypeError, ValueError):
+        recent_apply = False
     roles = {p["name"]: p["role"] for p in peers}
     members: List[Dict[str, Any]] = []
     healthy_ids, degraded_ids, unreachable_ids = [], [], []
+    updating_ids, serving_ids = [], []
     for link in links:
         member_id = link["id"]
         status = per_member.get(member_id) or {}
@@ -479,12 +524,21 @@ def summarize_ha(mode: str, peers: List[Dict[str, Any]],
             "subnet_count": status.get("subnet_count"),
             "error": status.get("message") or status.get("error") or "",
         })
+        member["serving"] = bool(ha.get("serving"))
+        if member["serving"]:
+            serving_ids.append(member_id)
         if not link["connected"] or status.get("status") != "SUCCESS":
             member["health"] = "unreachable"
             unreachable_ids.append(member_id)
         elif ha.get("ha_enabled") and ha.get("in_sync"):
             member["health"] = "healthy"
             healthy_ids.append(member_id)
+        elif ha.get("ha_enabled") and ha.get("transitional") and recent_apply:
+            # Applying the configuration it was just sent — expected, bounded
+            # and self-clearing. Reporting this as "degraded" is what made
+            # every routine NetBox sync look like an outage.
+            member["health"] = "updating"
+            updating_ids.append(member_id)
         else:
             member["health"] = "degraded"
             degraded_ids.append(member_id)
@@ -500,8 +554,15 @@ def summarize_ha(mode: str, peers: List[Dict[str, Any]],
     config_converged = have_all and len(set(reported.values())) == 1
     missing_digests = [mid for mid in member_ids if not reported.get(mid)]
     total = len(members)
+    # "updating" outranks "degraded" but never outranks a REAL fault: it is
+    # claimed only when every member is either already healthy or mid-apply,
+    # and at least one is mid-apply. One unreachable/degraded node and the
+    # pair is degraded again, exactly as before.
+    updating = bool(updating_ids) and not unreachable_ids and not degraded_ids
     if total and len(healthy_ids) == total and config_converged:
         state = "healthy"
+    elif updating:
+        state = "updating"
     elif healthy_ids:
         state = "degraded"
     else:
@@ -516,6 +577,14 @@ def summarize_ha(mode: str, peers: List[Dict[str, Any]],
             f"Kea node '{member_id}' is not reachable through the DHCP module; "
             f"check lm-dhcp-worker and kea-ctrl-agent on that host.")
     for member in members:
+        if member["health"] == "updating":
+            recommendations.append(
+                f"Kea node '{member['id']}' is applying the configuration it "
+                f"was just sent (HA state '{member['ha_state']}'). Kea takes a "
+                f"node out of service while it re-reads config and re-syncs "
+                f"leases; it returns automatically, typically within 30 "
+                f"seconds. No action needed.")
+            continue
         if member["health"] != "degraded":
             continue
         if not member["ha_enabled"]:
@@ -527,6 +596,14 @@ def summarize_ha(mode: str, peers: List[Dict[str, Any]],
                 f"Kea node '{member['id']}' reports communication with its "
                 f"partner interrupted (state {member['ha_state']}); check "
                 f"connectivity between the control agents.")
+        elif member.get("ha_state") in TRANSITIONAL_HA_STATES:
+            # Transitional but NOT excused by a recent apply — it has been
+            # sitting here on its own, which is a genuine fault.
+            recommendations.append(
+                f"Kea node '{member['id']}' is stuck in HA state "
+                f"'{member['ha_state']}' with no configuration apply in "
+                f"progress — it is NOT serving DHCP. Check that its partner "
+                f"is up and that the two control agents can reach each other.")
         else:
             recommendations.append(
                 f"Kea node '{member['id']}' is in HA state "
@@ -537,6 +614,14 @@ def summarize_ha(mode: str, peers: List[Dict[str, Any]],
             "Configuration state is unknown for: " + ", ".join(missing_digests)
             + " — the pair cannot be confirmed converged until every node "
               "reports its running configuration.")
+    elif not config_converged and updating:
+        # Mid-apply the two nodes legitimately hold different digests (the
+        # coordinator applies them one at a time). Saying "running DIFFERENT
+        # configurations" here reads as corruption; it is just the rollout.
+        recommendations.append(
+            "The two Kea nodes are still converging on the configuration just "
+            "applied — their running configurations differ until both finish. "
+            "This resolves itself; re-check in a few seconds.")
     elif not config_converged:
         recommendations.append(
             "The two Kea nodes are running DIFFERENT subnet/reservation "
@@ -552,6 +637,15 @@ def summarize_ha(mode: str, peers: List[Dict[str, Any]],
         "mode": coerce_mode(mode),
         "state": state,
         "healthy": state == "healthy",
+        # Applying configuration right now — a NORMAL phase, not a fault. The
+        # UI uses this to say "updating" instead of "needs attention".
+        "updating": updating,
+        "updating_members": updating_ids,
+        # At least one node is actually answering DHCP clients. In hot-standby
+        # only the primary serves, so this stays True through a rolling apply
+        # of the standby — the pair never stopped doing its job.
+        "serving": bool(serving_ids),
+        "serving_count": len(serving_ids),
         "config_converged": config_converged,
         "config_digests_missing": missing_digests,
         "peers": public_peers(peers),
