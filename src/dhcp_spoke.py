@@ -589,6 +589,11 @@ class DHCPSpoke(BaseSpoke):
             **base,
             "status": "SUCCESS",
             "healthy": bool(members_healthy and report.get("healthy")),
+            # A pair mid-apply is NOT unhealthy — it is doing exactly what the
+            # last sync asked. Surfaced separately so the UI can say "updating"
+            # rather than "needs attention" for a routine NetBox push.
+            "updating": bool(report.get("updating")),
+            "serving": bool(report.get("serving")),
             "diagnostics_source": source,
             "cluster": report,
             "members": per_member,
@@ -811,7 +816,15 @@ class DHCPSpoke(BaseSpoke):
             if cmd == "DHCP_STATUS":
                 report = await self.cluster.status()
                 return {"status": "SUCCESS",
-                        "running": bool(report.get("healthy")),
+                        # "running" means "is this DHCP service answering
+                        # clients", NOT "is HA fully converged". Tying it to
+                        # `healthy` made a pair that was serving leases report
+                        # as DOWN for the ~30s it spent applying a synced
+                        # config. `serving` is true while any node holds a
+                        # serving HA state.
+                        "running": bool(report.get("healthy")
+                                        or report.get("serving")),
+                        "updating": bool(report.get("updating")),
                         "subnet_count": max(
                             [m.get("subnet_count") or 0
                              for m in report.get("members", [])] or [0]),
