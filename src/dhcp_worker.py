@@ -43,6 +43,7 @@ class DhcpWorkerOps:
     """The fixed operation table exposed to the coordinator."""
 
     def __init__(self, mgr: KeaManager):
+        """Initialize DhcpWorkerOps with a KeaManager instance."""
         self.mgr = mgr
         self._snapshot: Optional[Dict[str, Any]] = None
 
@@ -91,6 +92,7 @@ class DhcpWorkerOps:
 
     @staticmethod
     def _config_of(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Extract the Dhcp4 configuration sub-dictionary from the command data."""
         cfg = data.get("config")
         if isinstance(cfg, dict) and "Dhcp4" in cfg:
             cfg = cfg["Dhcp4"]
@@ -664,19 +666,24 @@ class DhcpWorkerOps:
                 "subnet_count": subnet_count}
 
     def status(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_STATUS`` — return worker and local Kea service status."""
         return {"status": "SUCCESS", **self.mgr.status()}
 
     def list_subnets(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_LIST_SUBNETS`` — list subnets configured in local Kea."""
         return {"status": "SUCCESS", "subnets": self.mgr.list_subnets()}
 
     def list_leases(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_LIST_LEASES`` — query local Kea lease database."""
         return {"status": "SUCCESS",
                 "leases": self.mgr.list_leases(data.get("subnet") or None)}
 
     def list_reservations(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_LIST_RES`` — return static reservations configured locally."""
         return {"status": "SUCCESS", "reservations": self.mgr.list_reservations()}
 
     def delete_lease(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_DEL_LEASE`` — delete an active lease by IP or MAC from local Kea."""
         ip = data.get("ip") or data.get("ip-address")
         old_ip = data.get("old_ip")
         mac = data.get("mac") or data.get("hw-address")
@@ -700,12 +707,15 @@ class DhcpWorkerOps:
         return {"status": "SUCCESS", "purged": list(purged)}
 
     def diagnostics(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_DIAGNOSTICS`` — return local service, socket, and configuration health."""
         return self.mgr.diagnostics()
 
     def stats(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_STATS`` — query local Kea performance and packet statistics."""
         return self.mgr.get_stats()
 
     def op_table(self) -> Dict[str, Any]:
+        """Map KEAW operations to bound handler methods."""
         return {
             "KEAW_INSTALL_HOOKS": self.install_hooks,
             "KEAW_GET_CONFIG": self.get_config,
@@ -735,11 +745,12 @@ def build_worker(member_id: str, coordinator_url: str, secret: str,
     # default_port drives the URL normalization, which REJECTS a plaintext
     # ws:// to a remote coordinator (the PSK rides in the handshake).
     return ServiceWorkerClient(member_id, coordinator_url, secret,
-                               ops.op_table(), hostname=os.uname().nodename,
-                               default_port=DEFAULT_COORDINATOR_PORT)
+                                ops.op_table(), hostname=os.uname().nodename,
+                                default_port=DEFAULT_COORDINATOR_PORT)
 
 
 def main() -> None:
+    """Parse CLI arguments and run the Kea HA worker client event loop."""
     parser = argparse.ArgumentParser(description="Lab Manager Kea HA worker")
     parser.add_argument("--id", default=os.getenv("LM_DHCP_MEMBER_ID", ""),
                         help="HA member id (must match the module's member list "

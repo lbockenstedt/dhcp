@@ -1,3 +1,9 @@
+"""Local PKI management for Kea High Availability peer mutual TLS.
+
+Manages root CA generation, certificate issuance, and cryptographic validation
+for inter-node Kea HA communications.
+"""
+
 import hashlib
 import ipaddress
 import os
@@ -12,6 +18,7 @@ from cryptography.x509.oid import NameOID
 
 
 def _write(path: Path, data: bytes, mode: int) -> None:
+    """Safely write data to path using an atomic rename with the given file mode."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_bytes(data)
@@ -20,6 +27,7 @@ def _write(path: Path, data: bytes, mode: int) -> None:
 
 
 def _load_or_create_ca(root: Path):
+    """Load an existing root CA keypair or create a new self-signed root CA."""
     key_path = root / "ha-ca.key"
     cert_path = root / "ha-ca.pem"
     if key_path.exists() and cert_path.exists():

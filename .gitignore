@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 venv/
+.worktrees/
 
 # mTLS material and runtime secrets issued by the hub — never commit these
 certs/
