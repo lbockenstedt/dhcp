@@ -1,3 +1,9 @@
+"""Kea DHCP Control Agent REST client and configuration manager.
+
+Interacts with the local Kea Control Agent HTTP endpoint to inspect, modify,
+validate, and persist kea-dhcp4 daemon configuration, subnets, and host reservations.
+"""
+
 import base64
 import copy
 import logging
@@ -324,6 +330,7 @@ class KeaManager:
     """
 
     def __init__(self, ca_url: str = "http://localhost:8001"):
+        """Initialize KeaManager pointing at the Kea Control Agent HTTP URL."""
         self.ca_url = ca_url.rstrip("/")
         # One keep-alive Session reused across every RPC (sync() alone can fire
         # a config-get + config-set + config-write + subnet4-list in quick
@@ -335,6 +342,7 @@ class KeaManager:
     # ── Kea Control Agent RPC ─────────────────────────────────────────
 
     def _rpc(self, service: str, command: str, args: dict = None) -> dict:
+        """Send an RPC command dictionary to the Kea Control Agent and return the arguments result."""
         payload = {"command": command, "service": [service]}
         if args is not None:
             payload["arguments"] = args
@@ -387,9 +395,11 @@ class KeaManager:
             return []
 
     def get_config(self) -> dict:
+        """Retrieve the live Dhcp4 configuration from Kea."""
         return self._rpc("dhcp4", "config-get").get("Dhcp4", {})
 
     def _set_config(self, dhcp4_config: dict):
+        """Apply and persist a new Dhcp4 configuration dictionary."""
         self._rpc("dhcp4", "config-set", {"Dhcp4": dhcp4_config})
         self._rpc("dhcp4", "config-write", {})
 
@@ -453,6 +463,7 @@ class KeaManager:
     # ── Lease queries ─────────────────────────────────────────────────
 
     def list_leases(self, subnet: str = None) -> list:
+        """List active DHCPv4 leases, optionally filtered by subnet CIDR."""
         try:
             # ``lease4-get-all`` has no "all leases" sentinel value, and per
             # ISC docs omitting "arguments" entirely is supposed to mean
@@ -508,6 +519,7 @@ class KeaManager:
     # ── Manual reservation CRUD ───────────────────────────────────────
 
     def add_reservation(self, subnet_id: Any, ip: str, mac: str, hostname: str = "") -> dict:
+        """Add a static host reservation to the given subnet, purging any active lease."""
         cfg = self.get_config()
         norm_mac = _normalize_mac(mac)
         for sub in cfg.get("subnet4", []):
@@ -585,6 +597,7 @@ class KeaManager:
         return {"status": "SUCCESS", "lease_purge": {"purged": purged}}
 
     def delete_reservation(self, ip: str) -> dict:
+        """Remove a static host reservation matching the specified IP address."""
         cfg = self.get_config()
         for sub in cfg.get("subnet4", []):
             sub["reservations"] = [
@@ -621,12 +634,14 @@ class KeaManager:
                             f"start kea-ctrl-agent to enable DHCP."}
 
         def latest(key):
+            """Extract newest sample value from a Kea statistic list."""
             v = raw.get(key)
             if isinstance(v, list) and v and isinstance(v[0], list) and v[0]:
                 return v[0][0]
             return None
 
         def num(key):
+            """Extract numeric value from latest statistic sample, defaulting to 0."""
             val = latest(key)
             return val if isinstance(val, (int, float)) else 0
 
@@ -718,6 +733,7 @@ class KeaManager:
         return {"status": "SUCCESS", "global": global_stats, "subnets": subnets}
 
     def status(self) -> dict:
+        """Query the Kea Control Agent for live version and running status."""
         try:
             self._rpc("dhcp4", "version-get")
             running = True
@@ -762,6 +778,7 @@ class KeaManager:
         return actions
 
     def _heal_api_password_file(self) -> list:
+        """Restore missing or empty API password file to unblock kea-ctrl-agent."""
         path = self._API_PASSWORD_FILE
         try:
             needs_create = not os.path.exists(path) or os.path.getsize(path) == 0
@@ -1154,6 +1171,7 @@ class KeaManager:
 
     @staticmethod
     def _run_diag(cmd, timeout=5):
+        """Run a diagnostic subprocess command with a timeout and return output structure."""
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout)
@@ -1168,6 +1186,7 @@ class KeaManager:
             return {"ok": False, "exit_code": None, "output": "", "error": str(e)}
 
     def _unit_status(self, unit):
+        """Query systemd unit state properties via systemctl show."""
         result = self._run_diag([
             "systemctl", "show", unit,
             "--property=LoadState,ActiveState,SubState,NRestarts,ExecMainStatus",

@@ -60,6 +60,7 @@ class KeaHACoordinator:
 
     def __init__(self, transport, mode: str = "", hook_dir: str = "",
                  state_path: str = ""):
+        """Initialize the Kea cluster coordinator with transport, mode, and state path."""
         self.transport = transport
         self.mode = coerce_mode(mode)
         # Empty means "resolve on the node" — the multiarch triplet differs per
@@ -88,6 +89,7 @@ class KeaHACoordinator:
         self._load_state()
 
     def _get_lock(self) -> asyncio.Lock:
+        """Return or lazily create the transaction lock for this cluster."""
         if self._lock is None:
             self._lock = asyncio.Lock()
         return self._lock
@@ -223,9 +225,11 @@ class KeaHACoordinator:
 
     @property
     def enabled(self) -> bool:
+        """Whether HA clustering is currently enabled on the transport."""
         return bool(getattr(self.transport, "enabled", False))
 
     def members(self) -> List[Dict[str, Any]]:
+        """Return the list of configured cluster member dictionaries."""
         return list(getattr(self.transport, "members", []) or [])
 
     def peers(self) -> List[Dict[str, Any]]:
@@ -315,6 +319,7 @@ class KeaHACoordinator:
 
     async def _apply_locked(self, subnets: List[Any], reservations: List[Any],
                             timeout: float) -> Dict[str, Any]:
+        """Perform transactional validation, candidate rendering, and two-phase apply."""
         try:
             peers = self.peers()
         except KeaHAConfigError as e:
@@ -510,6 +515,7 @@ class KeaHACoordinator:
                  failed: List[str], errors: Dict[str, str], stage: str,
                  rolled_back: Optional[List[str]] = None,
                  message: str = "") -> Dict[str, Any]:
+        """Construct a structured execution result dictionary summarizing the transaction outcome."""
         verdict = {
             "status": status,
             "cluster": True,
@@ -617,5 +623,6 @@ class KeaHACoordinator:
         return report
 
     async def status(self) -> Dict[str, Any]:
+        """Fetch fresh member HA states, compute consensus/digests, and return status dictionary."""
         await self.refresh_status()
         return {"status": "SUCCESS", **self.report()}
