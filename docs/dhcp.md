@@ -37,7 +37,7 @@ None (no installer present).
 
 ## Key commands / handlers (`dhcp_spoke.handle_command`)
 
-`GET_VERSION`, `UPDATE_CONFIG` (rebuild manager), `DHCP_STATUS`, `DHCP_LIST_SUBNETS`, `DHCP_LIST_LEASES` (optional `subnet` CIDR filter), `DHCP_LIST_RES`, `DHCP_ADD_RES` (`ip`+`mac`+`subnet_id` required), `DHCP_UPDATE_RES` (delete-then-add), `DHCP_DEL_RES` (by `ip`), `DHCP_SYNC` (`sync(subnets, reservations)` — only-add-missing against existing IPs, best-effort with added/skipped counts), `DHCP_STATS` (`get_stats` via Kea `statistic-get-all` — global + per-subnet pool utilization `{total,assigned,declined,utilization_pct}` and headline packet counters discover/request/offer/ack/nak; relayed by `GET /api/dhcp/stats`).
+`GET_VERSION`, `UPDATE_CONFIG` (rebuild manager), `DHCP_STATUS`, `DHCP_LIST_SUBNETS`, `DHCP_LIST_LEASES` (optional `subnet` CIDR filter), `DHCP_DEL_LEASE` (evict active lease by IP), `DHCP_LIST_RES`, `DHCP_ADD_RES` (`ip`+`mac`+`subnet_id` required), `DHCP_UPDATE_RES` (delete-then-add), `DHCP_DEL_RES` (by `ip`), `DHCP_SYNC` (`sync(subnets, reservations)` — only-add-missing against existing IPs, best-effort with added/skipped counts), `DHCP_STATS` (`get_stats` via Kea `statistic-get-all` — global + per-subnet pool utilization `{total,assigned,declined,utilization_pct}` and headline packet counters discover/request/offer/ack/nak; relayed by `GET /api/dhcp/stats`), `DHCP_DIAGNOSTICS` (unit status, journal, and config validation), `DHCP_HA_CONFIG` (configure HA cluster), `DHCP_HA_ENROLL_WORKERS` (stage worker nodes), `DHCP_HA_COMMIT_ENROLLMENT` (commit worker topology), `DHCP_HA_STATUS` (cluster status report), `DHCP_HA_APPLY` (re-apply desired cluster configuration).
 
 ## High availability (two-node Kea pair)
 
