@@ -311,6 +311,7 @@ def resolve_hook_dir(explicit: str = "") -> str:
 
 
 def hook_paths(hook_dir: str = "") -> Dict[str, str]:
+    """Return mapped absolute paths for ha and lease_cmds C++ hook libraries."""
     base = resolve_hook_dir(hook_dir)
     return {"ha": f"{base}/libdhcp_ha.so",
             "lease_cmds": f"{base}/libdhcp_lease_cmds.so"}
@@ -684,6 +685,7 @@ def load_cluster_config(path: str) -> Dict[str, Any]:
 
 def save_cluster_config(path: str, members: List[Dict[str, Any]], mode: str,
                         hook_dir: str = "") -> None:
+    """Save the cluster configuration atomically and with restricted (0600) permissions."""
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)

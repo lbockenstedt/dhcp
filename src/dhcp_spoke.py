@@ -1,3 +1,9 @@
+"""DHCP spoke implementation for Lab Manager.
+
+Orchestrates ISC Kea DHCPv4 operations either via local Kea Control Agent
+or via high-availability clustering across redundant worker nodes.
+"""
+
 import asyncio
 import json
 import logging
@@ -84,19 +90,24 @@ class _DisabledTransport:
     members: List[Dict[str, str]] = []
 
     def set_members(self, members):
+        """No-op member setter returning empty list."""
         return []
 
     def member_ids(self):
+        """Return empty list of member identifiers."""
         return []
 
     def member_links(self):
+        """Return empty list of member connection links."""
         return []
 
     async def fanout(self, command, data, timeout=20.0, member_ids=None):
+        """Simulate failed fanout on disabled transport."""
         return {"status": "ERROR", "results": {}, "ok": [], "failed": [],
                 "message": "cluster transport unavailable"}
 
     async def call(self, member_id, command, data, timeout=20.0):
+        """Simulate failed single-node call on disabled transport."""
         return {"status": "ERROR", "message": "cluster transport unavailable"}
 
 
@@ -129,6 +140,7 @@ class DHCPSpoke(BaseSpoke):
     """
 
     def __init__(self, spoke_id: str, config: Dict[str, Any]):
+        """Initialize the DHCP spoke with ID, config, manager, and cluster coordinator."""
         super().__init__(spoke_id, config)
         ca_url = config.get("kea_ca_url", "http://localhost:8001")
         self.mgr = KeaManager(ca_url=ca_url)
@@ -188,6 +200,7 @@ class DHCPSpoke(BaseSpoke):
         return bool(self.cluster.enabled or self._pending_enrollment)
 
     def _load_pending_enrollment(self) -> Dict[str, Any]:
+        """Load pending worker enrollment state from disk if present."""
         try:
             with open(self._pending_enrollment_path, encoding="utf-8") as stream:
                 data = json.load(stream)
@@ -199,6 +212,7 @@ class DHCPSpoke(BaseSpoke):
             return {}
 
     def _save_pending_enrollment(self, data: Dict[str, Any]) -> None:
+        """Atomically persist staged worker enrollment state to disk."""
         path = Path(self._pending_enrollment_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -208,6 +222,7 @@ class DHCPSpoke(BaseSpoke):
         self._pending_enrollment = data
 
     def _clear_pending_enrollment(self) -> None:
+        """Remove pending enrollment state file and clear in-memory state."""
         self._pending_enrollment = {}
         try:
             os.unlink(self._pending_enrollment_path)
@@ -333,6 +348,7 @@ class DHCPSpoke(BaseSpoke):
                     "members": _redact_members(members), "workers": bootstraps}
 
     async def _commit_worker_enrollment(self) -> Dict[str, Any]:
+        """Finalize and commit staged worker enrollment into the active cluster configuration."""
         async with self.cluster.transaction():
             pending = self._pending_enrollment
             members = pending.get("members") or []
@@ -393,6 +409,7 @@ class DHCPSpoke(BaseSpoke):
             return result
 
     async def _apply_ha_config_locked(self, raw, data) -> Dict[str, Any]:
+        """Apply HA configuration under the cluster transaction lock."""
         previous = {
             "members": [dict(m) for m in self._transport.members],
             "mode": self.cluster.mode,
@@ -400,6 +417,7 @@ class DHCPSpoke(BaseSpoke):
         }
 
         def _restore():
+            """Roll back in-memory topology state to previous configuration."""
             self._transport.set_members(previous["members"])
             self.cluster.mode = previous["mode"]
             self._hook_dir = previous["hook_dir"]
@@ -490,6 +508,7 @@ class DHCPSpoke(BaseSpoke):
             cp.set_agent_secret(secret)
 
         def _restore_secret():
+            """Restore the previously configured agent PSK secret."""
             if previous_secret is not None and hasattr(cp, "restore_agent_secret"):
                 cp.restore_agent_secret(previous_secret)
 
@@ -547,6 +566,7 @@ class DHCPSpoke(BaseSpoke):
         return stood_down, unreachable
 
     def _listener_hint(self) -> Dict[str, Any]:
+        """Return listener port, path, and active serving status for telemetry."""
         cp = getattr(self, "control_plane", None)
         return {"port": int(os.environ.get("LM_DHCP_AGENT_PORT", "8770")),
                 "path": "/ws/agent",
@@ -752,6 +772,7 @@ class DHCPSpoke(BaseSpoke):
         return sorted(purged), errors
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch incoming spoke command to corresponding local or cluster handler."""
         cmd = command_type.upper()
 
         if cmd == "GET_VERSION":
@@ -904,6 +925,7 @@ class DHCPSpoke(BaseSpoke):
         return {"status": "ERROR", "error": f"Unknown command: {command_type}"}
 
     async def get_status(self) -> Dict[str, Any]:
+        """Return module telemetry and health summary for hub heartbeat polling."""
         # Polled by the hub for telemetry — offload the sync Kea CA RPC off the
         # shared loop (same reason as handle_command).
         if self.cluster.enabled:
@@ -936,6 +958,7 @@ class DHCPSpoke(BaseSpoke):
         }
 
     def get_version(self) -> str:
+        """Read and return version string from VERSION file."""
         from pathlib import Path
         try:
             return (Path(__file__).parent.parent / "VERSION").read_text().strip()
