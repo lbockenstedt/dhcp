@@ -93,16 +93,15 @@ jobs:
             target: dev
     steps:
       - uses: actions/checkout@v4
+        if: matrix.source == github.ref_name
         with:
           fetch-depth: 0
 
       - name: Skip pairs that do not apply to this push, or a missing target
         id: exists
+        if: matrix.source == github.ref_name
         run: |
-          if [ "${{ matrix.source }}" != "${{ github.ref_name }}" ]; then
-            echo "::notice::push was to '${{ github.ref_name }}'; the ${{ matrix.source }} -> ${{ matrix.target }} back-merge does not apply"
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-          elif git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
+          if git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::no '${{ matrix.target }}' branch in this repo; nothing to back-merge"
