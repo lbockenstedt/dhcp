@@ -42,9 +42,10 @@ name: backmerge
 #   * The back-merge graph is strictly DOWNWARD -- main -> {qa,dev}, qa -> dev.
 #     dev is never a source, so it is a terminal node. The longest possible
 #     chain is main -> qa -> dev and then it stops.
-#   * In practice even that chain does not fire: a merge performed with
-#     GITHUB_TOKEN does not spawn new workflow runs, and main -> dev is opened
-#     in parallel anyway, so qa -> dev has nothing left to carry.
+#   * In practice even that chain does not fire: a back-merge into qa is
+#     merged with GITHUB_TOKEN, which does not spawn new workflow runs (and
+#     main -> dev is opened in parallel anyway). Promotions into qa are merged
+#     by humans, so those pushes do trigger the qa -> dev run as intended.
 # Do not add dev as a source, and do not add main as a target.
 #
 # VERSION is handled by the same .github/scripts/promote.sh used by promote.yml
@@ -69,7 +70,7 @@ jobs:
     # the matrix expands, so `matrix.target` is empty there and both targets
     # would collapse into one queue (the qa run cancelling the dev run).
     concurrency:
-      group: backmerge-${{ matrix.source }}-to-${{ matrix.target }}
+      group: backmerge-to-${{ matrix.target }}
       cancel-in-progress: false
     strategy:
       fail-fast: false   # dev must still be offered the change if qa conflicts
@@ -99,8 +100,12 @@ jobs:
 
       - name: Skip pairs that do not apply to this push, or a missing target
         id: exists
-        if: matrix.source == github.ref_name
         run: |
+          if [ "${{ matrix.source }}" != "${{ github.ref_name }}" ]; then
+            echo "::notice::pair ${{ matrix.source }} -> ${{ matrix.target }} does not apply to push on ${{ github.ref_name }}"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
