@@ -3,9 +3,9 @@
 #
 # Used for BOTH directions of the flow:
 #   forward  (promote.yml)   dev -> qa -> main, plus the dev -> main override
-#   backward (backmerge.yml) main -> qa and main -> dev, so a commit made
-#                            directly on main does not leave the lower branches
-#                            permanently behind.
+#   backward (backmerge.yml) main -> qa, main -> dev, and qa -> dev, so a commit
+#                            made directly on main or a promotion fix on qa does
+#                            not leave the lower branches permanently behind.
 # One script for both on purpose: the VERSION pinning and conflict handling
 # below are the fiddly part, and a second copy of them would drift.
 #
