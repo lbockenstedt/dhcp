@@ -69,7 +69,7 @@ jobs:
     # the matrix expands, so `matrix.target` is empty there and both targets
     # would collapse into one queue (the qa run cancelling the dev run).
     concurrency:
-      group: backmerge-${{ matrix.source }}-to-${{ matrix.target }}
+      group: backmerge-to-${{ matrix.target }}
       cancel-in-progress: false
     strategy:
       fail-fast: false   # dev must still be offered the change if qa conflicts
