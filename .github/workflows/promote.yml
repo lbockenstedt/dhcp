@@ -159,8 +159,7 @@ jobs:
           if [ -n "$UNIT_PR" ]; then
             # Pessimistic default: only a confirmed exit 0 clears it.
             intent_state="fetch-failed"
-            unit_body="$(gh pr view "$UNIT_PR" --json body -q .body 2>/dev/null)"
-            if [ $? -eq 0 ]; then
+            if unit_body="$(gh pr view "$UNIT_PR" --json body -q .body 2>/dev/null)"; then
               if printf '%s\n' "$unit_body" \
                    | grep -qE '^#+.*Intent & Problem Statement'; then
                 intent="$(printf '%s\n' "$unit_body" | awk '
@@ -181,19 +180,29 @@ jobs:
           # No `|| echo 0` here: that masks a rev-list FAILURE as a genuine count
           # of 0, so the body would claim "0 commit(s)" for a promotion that may
           # carry many. Capture the real status, then default only on failure.
-          ncommits="$(git rev-list --count --no-merges "$base..$BR" 2>/dev/null)"
-          if [ $? -eq 0 ] && [ -n "$ncommits" ]; then
+          if ncommits="$(git rev-list --count --no-merges "$base..$BR" 2>/dev/null)" && [ -n "$ncommits" ]; then
             ncommits_ok="yes"
           else
             ncommits_ok="no"
             ncommits="0"
           fi
-          commits="$(git log --no-merges --format='- `%h` %s' "$base..$BR" 2>/dev/null | head -30)"
-          nfiles="$(git diff --name-only "$base...$BR" 2>/dev/null | wc -l | tr -d ' ')"
+          commits="$(git log --no-merges --format='- `%h` %s' "$base..$BR" 2>/dev/null | head -30 || true)"
+          diff_ok="no"
+          if diff_names="$(git diff --name-only "$base...$BR" 2>/dev/null)"; then
+            diff_ok="yes"
+            if [ -n "$diff_names" ]; then
+              nfiles="$(printf '%s\n' "$diff_names" | wc -l | tr -d ' ')"
+            else
+              nfiles="0"
+            fi
+            automation="$(printf '%s\n' "$diff_names" \
+                          | grep -E '^\.github/|\.sh$' | sed 's/^/- `/; s/$/`/' | head -20 || true)"
+          else
+            nfiles="UNKNOWN"
+            automation=""
+          fi
           files="$(git diff --numstat "$base...$BR" 2>/dev/null \
-                   | awk -F'\t' '{printf "- `%s` (+%s/-%s)\n", $3, $1, $2}' | head -30)"
-          automation="$(git diff --name-only "$base...$BR" 2>/dev/null \
-                        | grep -E '^\.github/|\.sh$' | sed 's/^/- `/; s/$/`/' | head -20 || true)"
+                   | awk -F'\t' '{printf "- `%s` (+%s/-%s)\n", $3, $1, $2}' | head -30 || true)"
           {
             printf '## Intent & Problem Statement\n\n'
             if [ -n "$UNIT_SUBJECT" ]; then
@@ -250,7 +259,9 @@ jobs:
             printf '## Guardrails & Side-Effect Assessment\n\n'
             printf -- '- Every tracked `VERSION` file is pinned to `%s`'"'"'s own sequence and\n' "$TGT"
             printf '  advanced one step here; a version set on `%s` never leaks across.\n' "$SRC"
-            if [ -n "$automation" ]; then
+            if [ "$diff_ok" != "yes" ]; then
+              printf -- '- Workflow and shell-script paths could not be determined (`git diff` failed) -- UNKNOWN.\n'
+            elif [ -n "$automation" ]; then
               printf -- '- This promotion changes **automation**, so it is not behaviour-neutral.\n'
               printf '  Workflow/script paths touched:\n\n%s\n' "$automation"
             else
