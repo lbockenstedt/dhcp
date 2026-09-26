@@ -180,6 +180,10 @@ jobs:
               fi
             fi
           else
+            if [ "$HAS_WORKFLOW_TOKEN" != "true" ]; then
+              echo "::error::could not diff origin/$TGT...$BR to preflight the push credential, and no WORKFLOW_TOKEN is configured. Add a repository secret WORKFLOW_TOKEN holding a token with 'workflow' scope, then re-run. No permissions: block can grant this -- it is a GitHub platform restriction."
+              exit 1
+            fi
             echo "::warning::could not diff origin/$TGT...$BR to preflight the push credential; attempting the push anyway"
           fi
           git push -f -q origin "$BR"
