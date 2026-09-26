@@ -65,11 +65,13 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -z "${PROMOTE_REEXEC:-}" ]; then
   PROMOTE_TMPDIR="$(mktemp -d)"
   cp "$here/promote.sh" "$PROMOTE_TMPDIR/"
-  [ -f "$here/bump_version.py" ] && cp "$here/bump_version.py" "$PROMOTE_TMPDIR/"
+  if [ -f "$here/bump_version.py" ]; then
+    cp "$here/bump_version.py" "$PROMOTE_TMPDIR/"
+  fi
   export PROMOTE_REEXEC=1 PROMOTE_TMPDIR
   exec bash "$PROMOTE_TMPDIR/promote.sh" "$@"
 fi
-trap '[ -n "${PROMOTE_TMPDIR:-}" ] && rm -rf "$PROMOTE_TMPDIR"' EXIT
+trap '[ -n "${PROMOTE_TMPDIR:-}" ] && rm -rf "$PROMOTE_TMPDIR" || true' EXIT
 
 version_files() { git ls-tree -r --name-only "origin/$TGT" | grep -E '(^|/)VERSION$' || true; }
 
@@ -133,7 +135,9 @@ for i in "${!units[@]}"; do
     picked_idx="$i"
     break
   fi
-  [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
+  if [ "$SPLIT" = "1" ]; then
+    echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
+  fi
 done
 
 if [ -z "$picked" ]; then
@@ -153,7 +157,9 @@ unit_subject="$(git log -1 --format=%s "$picked")"
 unit_pr="$(printf '%s' "$unit_subject" | sed -n 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p')"
 if [ -n "$unit_pr" ]; then
   body_first="$(git log -1 --format=%b "$picked" | sed -n '/./{p;q;}')"
-  [ -n "$body_first" ] && unit_subject="$body_first"
+  if [ -n "$body_first" ]; then
+    unit_subject="$body_first"
+  fi
 else
   # Squash merges land as "feat: thing (#123)".
   unit_pr="$(printf '%s' "$unit_subject" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
@@ -185,13 +191,15 @@ fi
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   before="$(cat "$f")"
-  python3 "$here/bump_version.py" "$f" >/dev/null
+  python3 "${PROMOTE_TMPDIR:-$here}/bump_version.py" "$f" >/dev/null
   echo "  $f: $before -> $(cat "$f")"
   git add "$f"
 done < <(version_files)
 
 subject="$LABEL: $SRC -> $TGT"
-[ "$SPLIT" = "1" ] && [ -n "$unit_pr" ] && subject="$subject (#$unit_pr)"
+if [ "$SPLIT" = "1" ] && [ -n "$unit_pr" ]; then
+  subject="$subject (#$unit_pr)"
+fi
 
 git commit -q -m "$subject" \
   -m "Code-only $LABEL. VERSION stays on ${TGT}'s own sequence, advanced one step here."
