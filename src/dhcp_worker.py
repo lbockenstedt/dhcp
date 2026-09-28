@@ -46,6 +46,10 @@ class DhcpWorkerOps:
         """Initialize DhcpWorkerOps with a KeaManager instance."""
         self.mgr = mgr
         self._snapshot: Optional[Dict[str, Any]] = None
+        # Separate DHCPv6 rollback slot: a v6 apply/rollback must never
+        # clobber (or be clobbered by) an in-flight v4 apply/rollback on the
+        # same worker — they are two independent Kea daemons/configs.
+        self._snapshot6: Optional[Dict[str, Any]] = None
 
     # ── Hooks ───────────────────────────────────────────────────────────────
 
@@ -142,6 +146,144 @@ class DhcpWorkerOps:
                     "message": f"Kea returned {type(cfg).__name__}, not a config"}
         return {"status": "SUCCESS", "config": cfg,
                 "digest": config_fingerprint(cfg)}
+
+    # ── DHCPv6 config lifecycle ─────────────────────────────────────────────
+    #
+    # Parallels the v4 methods above against Kea's separate dhcp6 daemon/CA
+    # service. This first pass deliberately omits the v4 path's advanced
+    # self-healing (hook-load diagnostics, HA-TLS/kea.conf permission repair,
+    # ABI/package-version detail) — those are proven fixes for known v4
+    # failure modes observed in production and have not yet been reproduced
+    # or ported for dhcp6. The safety-critical snapshot/rollback contract
+    # (never report SUCCESS unless both config-set AND config-write landed;
+    # restore-on-write-failure) is preserved.
+
+    @staticmethod
+    def _config6_of(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        cfg = data.get("config")
+        if isinstance(cfg, dict) and "Dhcp6" in cfg:
+            cfg = cfg["Dhcp6"]
+        return cfg if isinstance(cfg, dict) else None
+
+    def validate6(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_VALIDATE6`` — Kea's own ``config-test`` against dhcp6."""
+        cfg = self._config6_of(data)
+        if cfg is None:
+            return {"status": "ERROR", "message": "config (Dhcp6) is required"}
+        try:
+            self.mgr._rpc("dhcp6", "config-test", {"Dhcp6": cfg})
+        except Exception as e:  # noqa: BLE001 — a rejected config is the answer
+            return {"status": "ERROR", "message": str(e)}
+        return {"status": "SUCCESS", "digest": config_fingerprint(cfg)}
+
+    def get_config6(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_GET_CONFIG6`` — this node's FULL running ``Dhcp6`` config."""
+        try:
+            cfg = self.mgr.get_config6()
+        except Exception as e:  # noqa: BLE001
+            return {"status": "ERROR", "message": str(e)}
+        if not isinstance(cfg, dict):
+            return {"status": "ERROR",
+                    "message": f"Kea returned {type(cfg).__name__}, not a config"}
+        return {"status": "SUCCESS", "config": cfg,
+                "digest": config_fingerprint(cfg)}
+
+    def apply6(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_APPLY6`` — snapshot, ``config-set``, ``config-write`` on dhcp6.
+
+        Same mutated/restored reporting contract as :meth:`apply` — see there
+        for why the two Kea calls are distinguished."""
+        cfg = self._config6_of(data)
+        if cfg is None:
+            return {"status": "ERROR", "message": "config (Dhcp6) is required",
+                    "mutated": False}
+        try:
+            self._snapshot6 = copy.deepcopy(self.mgr.get_config6())
+        except Exception as e:  # noqa: BLE001
+            return {"status": "ERROR", "mutated": False,
+                    "message": f"cannot snapshot current DHCPv6 config for rollback: {e}"}
+        outcome = self.mgr.apply_config6(copy.deepcopy(cfg))
+        if outcome.get("set") and outcome.get("written"):
+            return {"status": "SUCCESS", "version": data.get("version"),
+                    "mutated": True, "digest": config_fingerprint(cfg)}
+        if not outcome.get("set"):
+            return {"status": "ERROR", "mutated": False,
+                    "message": outcome.get("error") or "config-set (Dhcp6) failed"}
+        # config-set landed, config-write did not: restore locally right now —
+        # see apply()'s identical restore-on-write-failure rationale.
+        restore = self.mgr.apply_config6(copy.deepcopy(self._snapshot6))
+        if restore.get("set") and restore.get("written"):
+            return {"status": "ERROR", "mutated": False, "restored": True,
+                    "message": (f"config-write failed ({outcome.get('error')}); "
+                                f"the previous DHCPv6 configuration was restored "
+                                f"and persisted on this node")}
+        if restore.get("set"):
+            return {"status": "PARTIAL", "mutated": True, "restored": False,
+                    "message": (f"config-write failed ({outcome.get('error')}); "
+                                f"the previous DHCPv6 configuration is running "
+                                f"again but could NOT be persisted "
+                                f"({restore.get('error')})")}
+        return {"status": "PARTIAL", "mutated": True, "restored": False,
+                "message": (f"config-write failed ({outcome.get('error')}) AND "
+                            f"the local restore failed ({restore.get('error')}) "
+                            f"— this node is running the new, unpersisted "
+                            f"DHCPv6 configuration")}
+
+    def rollback6(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_ROLLBACK6`` — restore the dhcp6 config from the last apply6."""
+        if self._snapshot6 is None:
+            return {"status": "ERROR", "message": "no DHCPv6 snapshot to roll back to"}
+        outcome = self.mgr.apply_config6(copy.deepcopy(self._snapshot6))
+        if not outcome.get("set"):
+            return {"status": "ERROR",
+                    "message": outcome.get("error") or "rollback config-set (Dhcp6) failed"}
+        if not outcome.get("written"):
+            return {"status": "PARTIAL",
+                    "digest": config_fingerprint(self._snapshot6),
+                    "message": (f"previous DHCPv6 configuration restored but not "
+                                f"persisted ({outcome.get('error')})")}
+        return {"status": "SUCCESS",
+                "digest": config_fingerprint(self._snapshot6)}
+
+    def standdown6(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_STANDDOWN6`` — leave the DHCPv6 HA pair cleanly (see
+        :meth:`standdown` for the v4 rationale, identical here)."""
+        try:
+            cfg = copy.deepcopy(self.mgr.get_config6())
+        except Exception as e:  # noqa: BLE001
+            return {"status": "ERROR", "message": str(e)}
+        before = len(cfg.get("hooks-libraries") or [])
+        cfg["hooks-libraries"] = [
+            h for h in (cfg.get("hooks-libraries") or [])
+            if isinstance(h, dict) and not str(h.get("library", "")).endswith(
+                ("libdhcp_ha.so", "libdhcp_lease_cmds.so"))]
+        removed = before - len(cfg["hooks-libraries"])
+        if not removed:
+            return {"status": "SUCCESS", "changed": False,
+                    "message": "no HA hooks were loaded"}
+        outcome = self.mgr.apply_config6(cfg)
+        if not (outcome.get("set") and outcome.get("written")):
+            return {"status": "ERROR", "changed": bool(outcome.get("set")),
+                    "message": outcome.get("error") or "could not remove the DHCPv6 HA hooks"}
+        return {"status": "SUCCESS", "changed": True, "hooks_removed": removed}
+
+    def ha_status6(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_HA_STATUS6`` — ``status-get`` (dhcp6) plus config digest."""
+        try:
+            raw = self.mgr._rpc("dhcp6", "status-get", {})
+        except Exception as e:  # noqa: BLE001
+            return {"status": "ERROR", "message": str(e), "running": False}
+        digest = ""
+        subnet_count = None
+        try:
+            cfg = self.mgr.get_config6()
+            digest = config_fingerprint(cfg)
+            subnet_count = len(cfg.get("subnet6") or [])
+        except Exception as e:  # noqa: BLE001 — HA state is still worth reporting
+            logger.debug("could not read DHCPv6 config for digest: %s", e)
+        return {"status": "SUCCESS", "running": True, "status_get": raw,
+                "ha": parse_ha_status(raw), "digest": digest,
+                "subnet_count": subnet_count}
 
     @staticmethod
     def _hook_load_failure_detail(error: str, hook_dir: str) -> str:
@@ -706,6 +848,33 @@ class DhcpWorkerOps:
                 purged.add(old_ip)
         return {"status": "SUCCESS", "purged": list(purged)}
 
+    # ── DHCPv6 read-only / lease ops (HA fanout targets) ────────────────────
+
+    def list_subnets6(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        return {"status": "SUCCESS", "subnets": self.mgr.list_subnets6()}
+
+    def list_leases6(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        return {"status": "SUCCESS",
+                "leases": self.mgr.list_leases6(data.get("subnet") or None)}
+
+    def list_reservations6(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        return {"status": "SUCCESS", "reservations": self.mgr.list_reservations6()}
+
+    def delete_lease6(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        ip = data.get("ip") or data.get("ip-address")
+        old_ip = data.get("old_ip")
+        mac = data.get("mac") or data.get("hw-address")
+        if not ip and not mac and not old_ip:
+            return {"status": "ERROR", "message": "ip, old_ip, or mac is required"}
+        purged = set()
+        if ip:
+            purged.update(self.mgr.purge_leases6_for_mac_or_ip(mac=mac, ip=ip))
+        if old_ip and old_ip != ip:
+            purged.update(self.mgr.purge_leases6_for_mac_or_ip(mac=mac, ip=old_ip))
+        if mac and not ip and not old_ip:
+            purged.update(self.mgr.purge_leases6_for_mac_or_ip(mac=mac))
+        return {"status": "SUCCESS", "purged": list(purged)}
+
     def diagnostics(self, _data: Dict[str, Any]) -> Dict[str, Any]:
         """``KEAW_DIAGNOSTICS`` — return local service, socket, and configuration health."""
         return self.mgr.diagnostics()
@@ -724,11 +893,21 @@ class DhcpWorkerOps:
             "KEAW_ROLLBACK": self.rollback,
             "KEAW_STANDDOWN": self.standdown,
             "KEAW_HA_STATUS": self.ha_status,
+            "KEAW_GET_CONFIG6": self.get_config6,
+            "KEAW_VALIDATE6": self.validate6,
+            "KEAW_APPLY6": self.apply6,
+            "KEAW_ROLLBACK6": self.rollback6,
+            "KEAW_STANDDOWN6": self.standdown6,
+            "KEAW_HA_STATUS6": self.ha_status6,
             "KEAW_STATUS": self.status,
             "KEAW_LIST_SUBNETS": self.list_subnets,
             "KEAW_LIST_LEASES": self.list_leases,
             "KEAW_LIST_RES": self.list_reservations,
             "KEAW_DEL_LEASE": self.delete_lease,
+            "KEAW_LIST_SUBNETS6": self.list_subnets6,
+            "KEAW_LIST_LEASES6": self.list_leases6,
+            "KEAW_LIST_RES6": self.list_reservations6,
+            "KEAW_DEL_LEASE6": self.delete_lease6,
             "KEAW_DIAGNOSTICS": self.diagnostics,
             "KEAW_STATS": self.stats,
         }

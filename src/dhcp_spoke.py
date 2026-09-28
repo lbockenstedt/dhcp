@@ -137,6 +137,19 @@ class DHCPSpoke(BaseSpoke):
       DHCP_HA_STATUS     — HA member state, lease sync, drift, recommendations
       DHCP_HA_CONFIG     — set the HA member pair + mode (+ worker secret)
       DHCP_HA_APPLY      — re-apply the current desired config to both nodes
+
+      DHCPv6 (dual-stack) — supported both single-node AND on an HA-clustered
+      pair (mirrors the v4 commands above via ``kea_cluster.py``'s v6-suffixed
+      coordinator path; independent version/journal from v4, same transaction
+      safety):
+      DHCP_SYNC6         — replace all subnet6 scopes + reservations
+      DHCP_LIST_SUBNETS6 — list all managed subnet6 scopes
+      DHCP_LIST_LEASES6  — list active DHCPv6 leases (optional subnet filter)
+      DHCP_ADD_RES6      — add a static DHCPv6 reservation (matched by hw-address)
+      DHCP_LIST_RES6     — list static DHCPv6 reservations
+      DHCP_DEL_RES6      — remove a static DHCPv6 reservation by address
+      DHCP_HA_STATUS6    — HA member state for the DHCPv6 daemon
+      DHCP_HA_APPLY6     — re-apply the current desired DHCPv6 config to both nodes
     """
 
     def __init__(self, spoke_id: str, config: Dict[str, Any]):
@@ -771,6 +784,49 @@ class DHCPSpoke(BaseSpoke):
             errors["cluster"] = reply.get("message") or "no node answered the lease purge"
         return sorted(purged), errors
 
+    async def _ha_reservation6(self, cmd: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """The DHCPv6 mirror of :meth:`_ha_reservation`."""
+        action = "delete" if cmd == "DHCP_DEL_RES6" else "upsert"
+        res = await self.cluster.mutate_reservation6(action, data)
+        if res.get("status") != "SUCCESS" or action == "delete":
+            return res
+
+        ip = data.get("ip")
+        old_ip = data.get("old_ip")
+        mac = data.get("mac")
+        try:
+            purged, errors = await self._purge_client_leases6(ip, old_ip, mac)
+        except Exception as e:  # noqa: BLE001
+            purged, errors = [], {"coordinator": str(e)}
+        res["lease_purge"] = {"purged": purged, "errors": errors}
+        if errors:
+            logger.warning(
+                "DHCPv6 reservation for %s applied, but the previous lease (%s) "
+                "could not be purged on %s: %s",
+                ip, old_ip or ip, ", ".join(sorted(errors)), errors)
+            res["status"] = "PARTIAL"
+            res["message"] = (
+                f"Reservation for {ip} applied, but the previous lease "
+                f"({old_ip or ip}) could not be removed on "
+                f"{', '.join(sorted(errors))}. The client will keep its "
+                f"current address until that lease expires.")
+        return res
+
+    async def _purge_client_leases6(self, ip, old_ip, mac):
+        """The DHCPv6 mirror of :meth:`_purge_client_leases`."""
+        reply = await self.cluster.transport.fanout(
+            "KEAW_DEL_LEASE6", {"ip": ip, "old_ip": old_ip, "mac": mac})
+        purged, errors = set(), {}
+        for member_id, r in (reply.get("results") or {}).items():
+            r = r if isinstance(r, dict) else {}
+            if r.get("status") == "SUCCESS":
+                purged.update(r.get("purged") or [])
+            else:
+                errors[member_id] = r.get("message") or "lease purge failed"
+        if not reply.get("results"):
+            errors["cluster"] = reply.get("message") or "no node answered the lease purge"
+        return sorted(purged), errors
+
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch incoming spoke command to corresponding local or cluster handler."""
         cmd = command_type.upper()
@@ -809,6 +865,51 @@ class DHCPSpoke(BaseSpoke):
                         "DHCP sync first."}
             return await self.cluster.apply(desired.get("subnets") or [],
                                             desired.get("reservations") or [])
+
+        if cmd == "DHCP_HA_STATUS6":
+            if not self.cluster.enabled:
+                return {"status": "SUCCESS", "enabled": False, "members": [],
+                        "member_count": 0, "mode": self.cluster.mode,
+                        "supported_modes": ["hot-standby"],
+                        "reason": "no Kea HA pair configured"}
+            return await self.cluster.status6()
+
+        if cmd == "DHCP_HA_APPLY6":
+            if not self.cluster.enabled:
+                return {"status": "ERROR", "message": "Kea HA is not enabled"}
+            desired6 = self.cluster.desired6
+            if not desired6.get("subnets"):
+                return {"status": "ERROR", "message":
+                        "No synchronised DHCPv6 configuration to re-apply — run "
+                        "a DHCPv6 sync first."}
+            return await self.cluster.apply6(desired6.get("subnets") or [],
+                                             desired6.get("reservations") or [])
+
+        # ── DHCPv6 (dual-stack) HA-cluster path: one transaction, both nodes,
+        # mirroring the v4 self.cluster.apply() path via the v6-suffixed
+        # coordinator methods (self.cluster.apply6 / mutate_reservation6).
+        _DHCP6_HA_COMMANDS = ("DHCP_SYNC6", "DHCP_LIST_SUBNETS6", "DHCP_LIST_LEASES6",
+                             "DHCP_DEL_LEASE6", "DHCP_ADD_RES6", "DHCP_DEL_RES6",
+                             "DHCP_LIST_RES6")
+        if cmd in _DHCP6_HA_COMMANDS and self.cluster.enabled:
+            if cmd == "DHCP_SYNC6":
+                return await self.cluster.apply6(data.get("subnets", []),
+                                                 data.get("reservations", []))
+            if cmd in ("DHCP_ADD_RES6", "DHCP_DEL_RES6"):
+                return await self._ha_reservation6(cmd, data)
+            if cmd == "DHCP_LIST_SUBNETS6":
+                return await self._ha_list("KEAW_LIST_SUBNETS6", {}, "subnets")
+            if cmd == "DHCP_LIST_LEASES6":
+                return await self._ha_list("KEAW_LIST_LEASES6",
+                                           {"subnet": data.get("subnet")}, "leases")
+            if cmd == "DHCP_DEL_LEASE6":
+                ip = data.get("ip") or data.get("ip-address")
+                if not ip:
+                    return {"status": "ERROR", "message": "ip is required"}
+                fan = await self.cluster.transport.fanout("KEAW_DEL_LEASE6", {"ip": ip})
+                return {"status": "SUCCESS", "results": fan.get("results", {})}
+            if cmd == "DHCP_LIST_RES6":
+                return await self._ha_list("KEAW_LIST_RES6", {}, "reservations")
 
         # ── HA path: both nodes are configured as one transaction ───────────
         if self.cluster.enabled:
@@ -911,6 +1012,46 @@ class DHCPSpoke(BaseSpoke):
             if not ip:
                 return {"status": "ERROR", "message": "ip is required"}
             return await asyncio.to_thread(self.mgr.delete_reservation, ip)
+
+        # ── DHCPv6 (dual-stack), single-node ─────────────────────────────
+        if cmd == "DHCP_SYNC6":
+            subnets      = data.get("subnets", [])
+            reservations = data.get("reservations", [])
+            return await asyncio.to_thread(self.mgr.sync6, subnets, reservations)
+
+        if cmd == "DHCP_LIST_SUBNETS6":
+            subnets = await asyncio.to_thread(self.mgr.list_subnets6)
+            return {"status": "SUCCESS", "subnets": subnets}
+
+        if cmd == "DHCP_LIST_LEASES6":
+            subnet = data.get("subnet")
+            leases = await asyncio.to_thread(self.mgr.list_leases6, subnet)
+            return {"status": "SUCCESS", "leases": leases}
+
+        if cmd == "DHCP_DEL_LEASE6":
+            ip = data.get("ip") or data.get("ip-address")
+            if not ip:
+                return {"status": "ERROR", "message": "ip is required"}
+            return await asyncio.to_thread(self.mgr.delete_lease6, ip)
+
+        if cmd == "DHCP_ADD_RES6":
+            subnet_id = data.get("subnet_id")
+            ip        = data.get("ip")
+            mac       = data.get("mac")
+            hostname  = data.get("hostname", "")
+            if not all([subnet_id, ip, mac]):
+                return {"status": "ERROR", "message": "subnet_id, ip, and mac are required"}
+            return await asyncio.to_thread(self.mgr.add_reservation6, int(subnet_id), ip, mac, hostname)
+
+        if cmd == "DHCP_LIST_RES6":
+            reservations = await asyncio.to_thread(self.mgr.list_reservations6)
+            return {"status": "SUCCESS", "reservations": reservations}
+
+        if cmd == "DHCP_DEL_RES6":
+            ip = data.get("ip")
+            if not ip:
+                return {"status": "ERROR", "message": "ip is required"}
+            return await asyncio.to_thread(self.mgr.delete_reservation6, ip)
 
         if cmd == "DHCP_STATUS":
             s = await asyncio.to_thread(self.mgr.status)
