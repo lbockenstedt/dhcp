@@ -911,7 +911,27 @@ class DHCPSpoke(BaseSpoke):
                 if not ip:
                     return {"status": "ERROR", "message": "ip is required"}
                 fan = await self.cluster.transport.fanout("KEAW_DEL_LEASE6", {"ip": ip})
-                return {"status": "SUCCESS", "results": fan.get("results", {})}
+                results = fan.get("results") or {}
+                if not results:
+                    # No node answered (also what _DisabledTransport returns):
+                    # that is NOT a successful purge.
+                    return {"status": "ERROR", "results": {},
+                            "message": fan.get("message")
+                            or "no node answered the DHCPv6 lease purge"}
+                member_errors = {}
+                for member_id, r in results.items():
+                    if not isinstance(r, dict):
+                        member_errors[member_id] = "malformed reply"
+                    elif r.get("status") != "SUCCESS":
+                        member_errors[member_id] = (r.get("message")
+                                                    or "lease purge failed")
+                if member_errors:
+                    return {"status": ("ERROR" if len(member_errors) == len(results)
+                                       else "PARTIAL"),
+                            "results": results, "member_errors": member_errors,
+                            "message": ("DHCPv6 lease purge failed on "
+                                        + ", ".join(sorted(member_errors)))}
+                return {"status": "SUCCESS", "results": results}
             if cmd == "DHCP_LIST_RES6":
                 return await self._ha_list("KEAW_LIST_RES6", {}, "reservations")
 

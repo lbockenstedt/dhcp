@@ -459,6 +459,15 @@ class KeaManager:
 
     def _rpc(self, service: str, command: str, args: dict = None) -> dict:
         """Send an RPC command dictionary to the Kea Control Agent and return the arguments result."""
+        return self._rpc_full(service, command, args).get("arguments", {})
+
+    def _rpc_full(self, service: str, command: str, args: dict = None) -> dict:
+        """Same call as :meth:`_rpc`, but returns the FULL Kea response object.
+
+        Callers that must tell "succeeded, found nothing" (Kea ``result: 3``)
+        apart from "succeeded and acted" (``result: 0``) need the result code,
+        which :meth:`_rpc` throws away. Transport/protocol failures still raise.
+        """
         payload = {"command": command, "service": [service]}
         if args is not None:
             payload["arguments"] = args
@@ -479,7 +488,7 @@ class KeaManager:
             # wrong — only 1 (error) and 2 (unsupported) are real failures.
             if code not in (0, 3):
                 raise RuntimeError(result.get("text", "Kea error"))
-            return result.get("arguments", {})
+            return result
         except requests.RequestException as e:
             raise RuntimeError(f"Kea CA unreachable: {e}")
 
@@ -805,7 +814,10 @@ class KeaManager:
                    len(kea_subnets), len(reservations))
         return {"status": "SUCCESS", "subnets": len(kea_subnets), "reservations": len(reservations)}
 
-    def list_leases6(self, subnet: str = None) -> list:
+    def list_leases6(self, subnet: str = None, strict: bool = False) -> list:
+        """Active DHCPv6 leases. ``strict=True`` re-raises instead of hiding an
+        unreachable Kea behind an empty list (a purge caller must be able to
+        tell "no leases" from "could not read the lease database")."""
         try:
             kea_subnets = self.list_subnets6()
             ids = [s["id"] for s in kea_subnets if "id" in s]
@@ -815,35 +827,63 @@ class KeaManager:
             return data.get("leases", [])
         except Exception as e:
             logger.error("list_leases6 failed: %s", e)
+            if strict:
+                raise
             return []
 
     def delete_lease6(self, ip: str) -> dict:
-        """Delete an active DHCPv6 lease by address via lease6-del RPC."""
+        """Delete an active DHCPv6 lease by address via ``lease6-del``.
+
+        THREE distinct outcomes, three distinct values — collapsing them made
+        an unreachable Kea look like a clean purge:
+
+        * deleted      → ``SUCCESS`` with ``not_found: False``
+        * no such lease→ ``SUCCESS`` with ``not_found: True`` (Kea ``result: 3``)
+        * RPC failed   → ``ERROR`` with the failure message
+        """
         try:
-            res = self._rpc("dhcp6", "lease6-del", {"ip-address": ip})
-            return {"status": "SUCCESS", "result": res}
-        except Exception as e:
-            logger.debug("delete_lease6 %s: %s", ip, e)
-            return {"status": "SUCCESS", "message": str(e), "not_found": True}
+            res = self._rpc_full("dhcp6", "lease6-del", {"ip-address": ip})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("delete_lease6 %s failed: %s", ip, e)
+            return {"status": "ERROR", "message": str(e)}
+        if int(res.get("result", 0) or 0) == 3:
+            return {"status": "SUCCESS", "not_found": True,
+                    "message": res.get("text") or "no such DHCPv6 lease"}
+        return {"status": "SUCCESS", "not_found": False,
+                "result": res.get("arguments", {})}
 
     def purge_leases6_for_mac_or_ip(self, mac: str = None, ip: str = None) -> list:
-        """Purge any active DHCPv6 lease for a given MAC or IPv6 address."""
+        """Purge active DHCPv6 lease(s) for a MAC and/or address.
+
+        Returns ONLY the addresses that actually had a lease removed. Raises
+        ``RuntimeError`` if a delete or the lease lookup failed, so a failed
+        purge can never be reported as a clean one.
+        """
         purged = []
         if ip:
-            self.delete_lease6(ip)
-            purged.append(ip)
+            res = self.delete_lease6(ip)
+            if res.get("status") != "SUCCESS":
+                raise RuntimeError(res.get("message")
+                                   or f"lease6-del failed for {ip}")
+            if not res.get("not_found"):
+                purged.append(ip)
         if mac:
             norm_mac = _normalize_mac(mac)
             try:
-                leases = self.list_leases6()
-                for l in leases:
-                    l_ip = l.get("ip-address") or l.get("ip")
-                    l_mac = _normalize_mac(l.get("hw-address") or l.get("mac"))
-                    if l_mac and l_mac == norm_mac and l_ip and l_ip not in purged:
-                        self.delete_lease6(l_ip)
+                leases = self.list_leases6(strict=True)
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    f"could not read the DHCPv6 lease database for {norm_mac}: {e}")
+            for l in leases:
+                l_ip = l.get("ip-address") or l.get("ip")
+                l_mac = _normalize_mac(l.get("hw-address") or l.get("mac"))
+                if l_mac and l_mac == norm_mac and l_ip and l_ip not in purged:
+                    res = self.delete_lease6(l_ip)
+                    if res.get("status") != "SUCCESS":
+                        raise RuntimeError(res.get("message")
+                                           or f"lease6-del failed for {l_ip}")
+                    if not res.get("not_found"):
                         purged.append(l_ip)
-            except Exception as e:
-                logger.warning("Could not purge DHCPv6 leases for %s: %s", norm_mac, e)
         return purged
 
     def add_reservation6(self, subnet_id: Any, ip: str, mac: str, hostname: str = "") -> dict:
@@ -864,8 +904,23 @@ class KeaManager:
         if "hw-address" not in identifiers:
             cfg["host-reservation-identifiers"] = list(identifiers) + ["hw-address"]
         self._set_config6(cfg)
-        purged = self.purge_leases6_for_mac_or_ip(mac=norm_mac, ip=ip)
-        return {"status": "SUCCESS", "lease_purge": {"purged": purged}}
+        # The reservation is already written and persisted at this point, so a
+        # failed lease purge must NOT be reported as a failed reservation —
+        # it is a distinct, lesser state: applied, but the client keeps its
+        # stale address until that lease expires.
+        try:
+            purged = self.purge_leases6_for_mac_or_ip(mac=norm_mac, ip=ip)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("DHCPv6 reservation for %s applied, but the previous "
+                           "lease could not be purged: %s", ip, e)
+            return {"status": "PARTIAL", "reservation_applied": True,
+                    "lease_purge": {"purged": [], "error": str(e)},
+                    "message": (f"Reservation for {ip} applied, but the previous "
+                                f"lease could not be removed ({e}). The client "
+                                f"will keep its current address until that lease "
+                                f"expires.")}
+        return {"status": "SUCCESS", "reservation_applied": True,
+                "lease_purge": {"purged": purged}}
 
     def list_reservations6(self) -> list:
         """Return all static DHCPv6 reservations across subnet6 scopes."""
