@@ -879,6 +879,22 @@ def test_the_exact_ui_payload_renders_both_node_configs():
         assert ha["mode"] == "hot-standby"
 
 
+def test_v6_node_config_enables_hw_address_reservation_matching():
+    """REGRESSION: dhcp6 matches reservations by DUID unless hw-address is in
+    host-reservation-identifiers — without it every rendered v6 reservation
+    would silently never match a client."""
+    from kea_ha import build_node_config6, build_peers
+    peers = build_peers(UI_PAYLOAD_MEMBERS, "hot-standby")
+    cfg = build_node_config6({}, peers[0]["name"], peers, "hot-standby", "",
+                             owned={"subnet6": []})
+    assert "hw-address" in cfg["host-reservation-identifiers"]
+    # An existing node-local list is preserved, not replaced.
+    cfg2 = build_node_config6({"host-reservation-identifiers": ["duid"]},
+                              peers[0]["name"], peers, "hot-standby", "",
+                              owned={"subnet6": []})
+    assert cfg2["host-reservation-identifiers"] == ["duid", "hw-address"]
+
+
 # ── Round 3, #5: the journal survives an incomplete rollback ───────────────
 
 def test_an_incomplete_rollback_retains_the_pending_journal(tmp_path):
