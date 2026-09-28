@@ -861,18 +861,29 @@ class DhcpWorkerOps:
         return {"status": "SUCCESS", "reservations": self.mgr.list_reservations6()}
 
     def delete_lease6(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_DEL_LEASE6`` — purge DHCPv6 lease(s) by address and/or MAC.
+
+        A purge RPC that FAILED must not look like "nothing to delete": the
+        coordinator builds its operator-visible errors from this status, so
+        collapsing an unreachable Kea into SUCCESS reports a clean apply while
+        the client keeps its stale address.
+        """
         ip = data.get("ip") or data.get("ip-address")
         old_ip = data.get("old_ip")
         mac = data.get("mac") or data.get("hw-address")
         if not ip and not mac and not old_ip:
             return {"status": "ERROR", "message": "ip, old_ip, or mac is required"}
         purged = set()
-        if ip:
-            purged.update(self.mgr.purge_leases6_for_mac_or_ip(mac=mac, ip=ip))
-        if old_ip and old_ip != ip:
-            purged.update(self.mgr.purge_leases6_for_mac_or_ip(mac=mac, ip=old_ip))
-        if mac and not ip and not old_ip:
-            purged.update(self.mgr.purge_leases6_for_mac_or_ip(mac=mac))
+        try:
+            if ip:
+                purged.update(self.mgr.purge_leases6_for_mac_or_ip(mac=mac, ip=ip))
+            if old_ip and old_ip != ip:
+                purged.update(self.mgr.purge_leases6_for_mac_or_ip(mac=mac, ip=old_ip))
+            if mac and not ip and not old_ip:
+                purged.update(self.mgr.purge_leases6_for_mac_or_ip(mac=mac))
+        except Exception as e:  # noqa: BLE001
+            return {"status": "ERROR", "purged": sorted(purged),
+                    "message": f"DHCPv6 lease purge failed: {e}"}
         return {"status": "SUCCESS", "purged": list(purged)}
 
     def diagnostics(self, _data: Dict[str, Any]) -> Dict[str, Any]:

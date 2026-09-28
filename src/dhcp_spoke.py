@@ -21,7 +21,8 @@ except ImportError:
 from kea_manager import KeaManager
 
 from kea_ha import (
-    DEFAULT_CLUSTER_CONFIG, DEFAULT_DESIRED_STATE, DHCP_WORKER_OPS,
+    DEFAULT_CLUSTER_CONFIG, DEFAULT_DESIRED_STATE, DEFAULT_DESIRED_STATE6,
+    DHCP_WORKER_OPS,
     KeaHAConfigError, UnsupportedHAMode, build_peers, load_cluster_config,
     normalize_mode, save_cluster_config,
 )
@@ -180,7 +181,10 @@ class DHCPSpoke(BaseSpoke):
             self._transport, mode=mode, hook_dir=self._hook_dir,
             state_path=config.get(
                 "desired_state",
-                os.getenv("LM_DHCP_DESIRED_STATE", DEFAULT_DESIRED_STATE)))
+                os.getenv("LM_DHCP_DESIRED_STATE", DEFAULT_DESIRED_STATE)),
+            state_path6=config.get(
+                "desired_state6",
+                os.getenv("LM_DHCP_DESIRED_STATE6", DEFAULT_DESIRED_STATE6)))
 
     # ── Cluster plumbing ────────────────────────────────────────────────────
 
