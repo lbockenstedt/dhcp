@@ -322,6 +322,122 @@ def build_subnet4(subnets: list, reservations: list) -> tuple:
     return kea_subnets, applied_count, len(reservations) - applied_count
 
 
+def build_subnet6(subnets: list, reservations: list) -> tuple:
+    """Translate LM/NetBox intent into Kea's ``subnet6`` list (DHCPv6).
+
+    Mirrors :func:`build_subnet4`'s contract — ``(kea_subnets, applied_count,
+    skipped_count)`` — but adapted to DHCPv6 semantics:
+
+    - No ``gateway``/``routers`` option: DHCPv6 clients learn their default
+      router from Router Advertisements, never from the DHCP server.
+    - The DNS option name is ``dns-servers`` (RFC 3646), not
+      ``domain-name-servers``.
+    - No network/broadcast address reservation: IPv6 has no broadcast
+      address, so (unlike v4's ".10 → .254") the default pool spans the
+      WHOLE subnet — handing out a full /64 pool is the normal, expected
+      Kea DHCPv6 configuration.
+    - Reservations are matched by ``hw-address`` (this fleet has no DUID
+      capture path yet) and use DHCPv6's ``ip-addresses`` key — a LIST, not
+      the singular ``ip-address`` v4 uses — because a v6 host reservation
+      can in principle carry more than one address. Matching by hw-address
+      requires the subnet's ``Dhcp6.host-reservation-identifiers`` include
+      ``"hw-address"``; :meth:`KeaManager.sync6` ensures that's set.
+    """
+    kea_subnets = []
+    applied = [False] * len(reservations)
+    used_ids: set = set()
+    for s in subnets:
+        subnet_str = s.get("subnet", "")
+        try:
+            net = ipaddress.ip_network(subnet_str, strict=False)
+        except ValueError:
+            logger.warning("Invalid subnet6 %s — skipping", subnet_str)
+            continue
+        if net.version != 6:
+            logger.warning("build_subnet6: %s is not IPv6 — skipping", subnet_str)
+            continue
+        idx = _stable_subnet_id(subnet_str, used_ids)
+
+        pools = [
+            {"pool": f"{p['start']} - {p['end']}"}
+            for p in s.get("pools", [])
+            if p.get("start") and p.get("end")
+        ]
+        excl_raw = s.get("exclusion_ranges") or s.get("exclusions")
+        if excl_raw:
+            exclusions = _parse_exclusion_ranges(excl_raw)
+            if pools:
+                base_ranges = []
+                for p in s.get("pools", []):
+                    if p.get("start") and p.get("end"):
+                        try:
+                            s_int = int(ipaddress.ip_address(p["start"]))
+                            e_int = int(ipaddress.ip_address(p["end"]))
+                            if s_int <= e_int:
+                                base_ranges.append((s_int, e_int))
+                        except ValueError:
+                            pass
+            else:
+                base_ranges = [(int(net.network_address), int(net.broadcast_address))]
+            pools = _carve_pools(base_ranges, exclusions)
+        elif not pools:
+            # Default pool: the whole subnet — IPv6 has no reserved
+            # network/broadcast address the way v4 does.
+            pools = [{"pool": f"{net.network_address} - {net.broadcast_address}"}]
+
+        kea_subnet = {
+            "id":     idx,
+            "subnet": str(net),
+            "pools":  pools,
+            "option-data": [],
+        }
+        description = (s.get("description") or "").strip()
+        if description:
+            kea_subnet["user-context"] = {"description": description}
+        dns = s.get("dns_servers", [])
+        if dns:
+            kea_subnet["option-data"].append(
+                {"name": "dns-servers", "data": ", ".join(dns)}
+            )
+        _add_option(kea_subnet, "domain-search", s.get("search_domains"))
+        lease_time = s.get("lease_time")
+        try:
+            if lease_time:
+                kea_subnet["valid-lifetime"] = int(lease_time)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring non-numeric lease_time %r for %s",
+                           lease_time, subnet_str)
+
+        subnet_res = []
+        for res_idx, r in enumerate(reservations):
+            ip, mac = r.get("ip"), r.get("mac")
+            if not ip or not mac:
+                continue
+            try:
+                ip_obj = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if ip_obj.version != 6:
+                continue
+            in_subnet = (str(r.get("subnet_id")) == str(idx)
+                         or r.get("subnet") == subnet_str
+                         or ip_obj in net)
+            if in_subnet:
+                subnet_res.append({
+                    "ip-addresses": [ip],
+                    "hw-address": _normalize_mac(mac),
+                    "hostname": r.get("hostname", ""),
+                })
+                applied[res_idx] = True
+        if subnet_res:
+            kea_subnet["reservations"] = subnet_res
+
+        kea_subnets.append(kea_subnet)
+
+    applied_count = sum(1 for flag in applied if flag)
+    return kea_subnets, applied_count, len(reservations) - applied_count
+
+
 
 class KeaManager:
     """
@@ -343,6 +459,15 @@ class KeaManager:
 
     def _rpc(self, service: str, command: str, args: dict = None) -> dict:
         """Send an RPC command dictionary to the Kea Control Agent and return the arguments result."""
+        return self._rpc_full(service, command, args).get("arguments", {})
+
+    def _rpc_full(self, service: str, command: str, args: dict = None) -> dict:
+        """Same call as :meth:`_rpc`, but returns the FULL Kea response object.
+
+        Callers that must tell "succeeded, found nothing" (Kea ``result: 3``)
+        apart from "succeeded and acted" (``result: 0``) need the result code,
+        which :meth:`_rpc` throws away. Transport/protocol failures still raise.
+        """
         payload = {"command": command, "service": [service]}
         if args is not None:
             payload["arguments"] = args
@@ -363,7 +488,7 @@ class KeaManager:
             # wrong — only 1 (error) and 2 (unsupported) are real failures.
             if code not in (0, 3):
                 raise RuntimeError(result.get("text", "Kea error"))
-            return result.get("arguments", {})
+            return result
         except requests.RequestException as e:
             raise RuntimeError(f"Kea CA unreachable: {e}")
 
@@ -605,6 +730,226 @@ class KeaManager:
                 if r.get("ip-address") != ip
             ]
         self._set_config(cfg)
+        return {"status": "SUCCESS"}
+
+    # ── DHCPv6 (dual-stack) ────────────────────────────────────────────
+    #
+    # Parallels the DHCPv4 methods above against Kea's separate ``dhcp6``
+    # Control Agent service / ``Dhcp6`` config tree — Kea runs DHCPv4 and
+    # DHCPv6 as independent daemons with independent config, so every RPC
+    # here targets ``service=["dhcp6"]`` and reads/writes ``Dhcp6`` instead
+    # of ``Dhcp4``. This first pass covers config sync, leases, and
+    # reservations for a single (non-HA) node; HA/cluster dual-stack
+    # propagation is tracked as follow-up work.
+
+    def get_config6(self) -> dict:
+        return self._rpc("dhcp6", "config-get").get("Dhcp6", {})
+
+    def _set_config6(self, dhcp6_config: dict):
+        self._rpc("dhcp6", "config-set", {"Dhcp6": dhcp6_config})
+        self._rpc("dhcp6", "config-write", {})
+
+    def apply_config6(self, dhcp6_config: dict) -> dict:
+        """``config-set`` then ``config-write`` as two observable steps —
+        see :meth:`apply_config` for why these are kept separate."""
+        try:
+            self._rpc("dhcp6", "config-set", {"Dhcp6": dhcp6_config})
+        except Exception as e:  # noqa: BLE001 — a rejected config is the answer
+            return {"set": False, "written": False, "error": str(e)}
+        try:
+            self._rpc("dhcp6", "config-write", {})
+        except Exception as e:  # noqa: BLE001
+            return {"set": True, "written": False, "error": str(e)}
+        return {"set": True, "written": True, "error": ""}
+
+    def write_config6(self) -> dict:
+        """Retry ``config-write`` alone against the already-set running
+        DHCPv6 config — see :meth:`write_config`."""
+        try:
+            self._rpc("dhcp6", "config-write", {})
+        except Exception as e:  # noqa: BLE001
+            return {"written": False, "error": str(e)}
+        return {"written": True, "error": ""}
+
+    def list_subnets6(self) -> list:
+        """Configured subnet6 scopes, straight from the running config — see
+        :meth:`list_subnets` for why this reads ``config-get`` rather than
+        the ``subnet6-list`` hook command."""
+        try:
+            return self.get_config6().get("subnet6", []) or []
+        except Exception as e:
+            logger.error("list_subnets6 failed: %s", e)
+            return []
+
+    def sync6(self, subnets: list, reservations: list) -> dict:
+        """Full DHCPv6 sync: replace all subnet6 scopes and reservations.
+
+        subnets:      [{subnet, dns_servers, pools: [{start, end}], description}]
+        reservations: [{ip, mac, hostname, subnet}] (IPv4 rows are ignored —
+                       :func:`build_subnet6` filters by address family)
+        """
+        try:
+            cfg = self.get_config6()
+        except Exception as e:
+            return {"status": "ERROR", "message": f"Cannot read Kea DHCPv6 config: {e}"}
+
+        kea_subnets, _applied, _skipped = build_subnet6(subnets, reservations)
+
+        # hw-address reservation matching in DHCPv6 requires this identifier
+        # be explicitly enabled — Kea defaults to DUID-only for v6. Without
+        # it, every hw-address reservation written above would silently
+        # never match a client (no error, the client just never gets its
+        # reserved address).
+        identifiers = cfg.get("host-reservation-identifiers") or []
+        if "hw-address" not in identifiers:
+            cfg["host-reservation-identifiers"] = list(identifiers) + ["hw-address"]
+
+        cfg["subnet6"] = kea_subnets
+        try:
+            self._set_config6(cfg)
+        except Exception as e:
+            return {"status": "ERROR", "message": str(e)}
+
+        logger.info("Synced %d subnet6 scopes, %d reservations to Kea DHCPv6",
+                   len(kea_subnets), len(reservations))
+        return {"status": "SUCCESS", "subnets": len(kea_subnets), "reservations": len(reservations)}
+
+    def list_leases6(self, subnet: str = None, strict: bool = False) -> list:
+        """Active DHCPv6 leases. ``strict=True`` re-raises instead of hiding an
+        unreachable Kea behind an empty list (a purge caller must be able to
+        tell "no leases" from "could not read the lease database")."""
+        try:
+            kea_subnets = self.list_subnets6()
+            ids = [s["id"] for s in kea_subnets if "id" in s]
+            if subnet:
+                ids = [s["id"] for s in kea_subnets if s.get("subnet") == subnet]
+            data = self._rpc("dhcp6", "lease6-get-all", {"subnets": ids})
+            return data.get("leases", [])
+        except Exception as e:
+            logger.error("list_leases6 failed: %s", e)
+            if strict:
+                raise
+            return []
+
+    def delete_lease6(self, ip: str) -> dict:
+        """Delete an active DHCPv6 lease by address via ``lease6-del``.
+
+        THREE distinct outcomes, three distinct values — collapsing them made
+        an unreachable Kea look like a clean purge:
+
+        * deleted      → ``SUCCESS`` with ``not_found: False``
+        * no such lease→ ``SUCCESS`` with ``not_found: True`` (Kea ``result: 3``)
+        * RPC failed   → ``ERROR`` with the failure message
+        """
+        try:
+            res = self._rpc_full("dhcp6", "lease6-del", {"ip-address": ip})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("delete_lease6 %s failed: %s", ip, e)
+            return {"status": "ERROR", "message": str(e)}
+        if int(res.get("result", 0) or 0) == 3:
+            return {"status": "SUCCESS", "not_found": True,
+                    "message": res.get("text") or "no such DHCPv6 lease"}
+        return {"status": "SUCCESS", "not_found": False,
+                "result": res.get("arguments", {})}
+
+    def purge_leases6_for_mac_or_ip(self, mac: str = None, ip: str = None) -> list:
+        """Purge active DHCPv6 lease(s) for a MAC and/or address.
+
+        Returns ONLY the addresses that actually had a lease removed. Raises
+        ``RuntimeError`` if a delete or the lease lookup failed, so a failed
+        purge can never be reported as a clean one.
+        """
+        purged = []
+        if ip:
+            res = self.delete_lease6(ip)
+            if res.get("status") != "SUCCESS":
+                raise RuntimeError(res.get("message")
+                                   or f"lease6-del failed for {ip}")
+            if not res.get("not_found"):
+                purged.append(ip)
+        if mac:
+            norm_mac = _normalize_mac(mac)
+            try:
+                leases = self.list_leases6(strict=True)
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    f"could not read the DHCPv6 lease database for {norm_mac}: {e}")
+            for l in leases:
+                l_ip = l.get("ip-address") or l.get("ip")
+                l_mac = _normalize_mac(l.get("hw-address") or l.get("mac"))
+                if l_mac and l_mac == norm_mac and l_ip and l_ip not in purged:
+                    res = self.delete_lease6(l_ip)
+                    if res.get("status") != "SUCCESS":
+                        raise RuntimeError(res.get("message")
+                                           or f"lease6-del failed for {l_ip}")
+                    if not res.get("not_found"):
+                        purged.append(l_ip)
+        return purged
+
+    def add_reservation6(self, subnet_id: Any, ip: str, mac: str, hostname: str = "") -> dict:
+        cfg = self.get_config6()
+        norm_mac = _normalize_mac(mac)
+        for sub in cfg.get("subnet6", []):
+            if str(sub.get("id")) == str(subnet_id):
+                sub.setdefault("reservations", [])
+                sub["reservations"].append({
+                    "ip-addresses": [ip],
+                    "hw-address":   norm_mac,
+                    "hostname":     hostname,
+                })
+                break
+        else:
+            return {"status": "ERROR", "message": f"Subnet6 {subnet_id} not found"}
+        identifiers = cfg.get("host-reservation-identifiers") or []
+        if "hw-address" not in identifiers:
+            cfg["host-reservation-identifiers"] = list(identifiers) + ["hw-address"]
+        self._set_config6(cfg)
+        # The reservation is already written and persisted at this point, so a
+        # failed lease purge must NOT be reported as a failed reservation —
+        # it is a distinct, lesser state: applied, but the client keeps its
+        # stale address until that lease expires.
+        try:
+            purged = self.purge_leases6_for_mac_or_ip(mac=norm_mac, ip=ip)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("DHCPv6 reservation for %s applied, but the previous "
+                           "lease could not be purged: %s", ip, e)
+            return {"status": "PARTIAL", "reservation_applied": True,
+                    "lease_purge": {"purged": [], "error": str(e)},
+                    "message": (f"Reservation for {ip} applied, but the previous "
+                                f"lease could not be removed ({e}). The client "
+                                f"will keep its current address until that lease "
+                                f"expires.")}
+        return {"status": "SUCCESS", "reservation_applied": True,
+                "lease_purge": {"purged": purged}}
+
+    def list_reservations6(self) -> list:
+        """Return all static DHCPv6 reservations across subnet6 scopes."""
+        out = []
+        try:
+            cfg = self.get_config6()
+        except Exception as e:
+            logger.error("list_reservations6 failed: %s", e)
+            return out
+        for sub in cfg.get("subnet6", []):
+            for r in sub.get("reservations", []):
+                addrs = r.get("ip-addresses") or ([r["ip-address"]] if r.get("ip-address") else [])
+                out.append({
+                    "ip":        addrs[0] if addrs else "",
+                    "mac":       r.get("hw-address", ""),
+                    "hostname":  r.get("hostname", ""),
+                    "subnet_id": sub.get("id"),
+                    "subnet":    sub.get("subnet", ""),
+                })
+        return out
+
+    def delete_reservation6(self, ip: str) -> dict:
+        cfg = self.get_config6()
+        for sub in cfg.get("subnet6", []):
+            sub["reservations"] = [
+                r for r in sub.get("reservations", [])
+                if ip not in (r.get("ip-addresses") or [])
+            ]
+        self._set_config6(cfg)
         return {"status": "SUCCESS"}
 
     # ── Statistics ────────────────────────────────────────────────────
