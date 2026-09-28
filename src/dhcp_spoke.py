@@ -146,6 +146,7 @@ class DHCPSpoke(BaseSpoke):
       DHCP_SYNC6         — replace all subnet6 scopes + reservations
       DHCP_LIST_SUBNETS6 — list all managed subnet6 scopes
       DHCP_LIST_LEASES6  — list active DHCPv6 leases (optional subnet filter)
+      DHCP_DEL_LEASE6    — delete an active DHCPv6 lease by address
       DHCP_ADD_RES6      — add a static DHCPv6 reservation (matched by hw-address)
       DHCP_LIST_RES6     — list static DHCPv6 reservations
       DHCP_DEL_RES6      — remove a static DHCPv6 reservation by address

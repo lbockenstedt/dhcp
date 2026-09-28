@@ -424,6 +424,18 @@ def build_node_config6(node_dhcp6: Dict[str, Any], this_name: str,
     for key in COORDINATOR_OWNED_KEYS6:
         if owned is not None and key in owned:
             cfg[key] = copy.deepcopy(owned[key])
+    # Kea's dhcp6 matches host reservations by DUID unless ``hw-address`` is
+    # explicitly listed in ``host-reservation-identifiers``. Every reservation
+    # this coordinator renders is keyed by hw-address (see ``build_subnet6``),
+    # so without this the pair would accept the config, report SUCCESS and
+    # then silently never match a client. Mirrors ``KeaManager.sync6``.
+    identifiers = cfg.get("host-reservation-identifiers") or []
+    if not isinstance(identifiers, list):
+        identifiers = []
+    if "hw-address" not in identifiers:
+        cfg["host-reservation-identifiers"] = list(identifiers) + ["hw-address"]
+    else:
+        cfg["host-reservation-identifiers"] = list(identifiers)
     keep = [h for h in (cfg.get("hooks-libraries") or [])
             if isinstance(h, dict)
             and not str(h.get("library", "")).endswith(
