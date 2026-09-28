@@ -3,9 +3,9 @@
 #
 # Used for BOTH directions of the flow:
 #   forward  (promote.yml)   dev -> qa -> main, plus the dev -> main override
-#   backward (backmerge.yml) main -> qa, main -> dev, and qa -> dev, so a commit
-#                            made directly on main or a promotion fix on qa does
-#                            not leave the lower branches permanently behind.
+#   backward (backmerge.yml) main -> qa and main -> dev, so a commit made
+#                            directly on main does not leave the lower branches
+#                            permanently behind.
 # One script for both on purpose: the VERSION pinning and conflict handling
 # below are the fiddly part, and a second copy of them would drift.
 #
@@ -65,13 +65,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -z "${PROMOTE_REEXEC:-}" ]; then
   PROMOTE_TMPDIR="$(mktemp -d)"
   cp "$here/promote.sh" "$PROMOTE_TMPDIR/"
-  if [ -f "$here/bump_version.py" ]; then
-    cp "$here/bump_version.py" "$PROMOTE_TMPDIR/"
-  fi
+  [ -f "$here/bump_version.py" ] && cp "$here/bump_version.py" "$PROMOTE_TMPDIR/"
   export PROMOTE_REEXEC=1 PROMOTE_TMPDIR
   exec bash "$PROMOTE_TMPDIR/promote.sh" "$@"
 fi
-trap '[ -n "${PROMOTE_TMPDIR:-}" ] && rm -rf "$PROMOTE_TMPDIR" || true' EXIT
+trap '[ -n "${PROMOTE_TMPDIR:-}" ] && rm -rf "$PROMOTE_TMPDIR"' EXIT
 
 version_files() { git ls-tree -r --name-only "origin/$TGT" | grep -E '(^|/)VERSION$' || true; }
 
@@ -87,9 +85,9 @@ fi
 [ "${#units[@]}" -gt 0 ] || units=("origin/$SRC")
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
-# Returns 0 when that produced a real change and 1 when it is a content no-op.
-# A merge conflict outside VERSION is not returned: it aborts the whole script
-# (exit 1) so a human can resolve it.
+# Returns 0 when that produced a real change, 1 when it is a content no-op, and
+# 2 when a split unit conflicts against $TGT (the caller falls back to a batched
+# merge). Callers MUST capture the code -- `if stage_to ...` cannot tell 1 from 2.
 stage_to() {
   local endpoint="$1"
 
@@ -118,11 +116,11 @@ stage_to() {
   done < <(git diff --cached --name-only --diff-filter=A | grep -E '(^|/)VERSION$' || true)
 
   if git ls-files -u | grep -q .; then
-    # Diagnose, but do NOT decide. A conflict on an intermediate unit is
-    # recoverable -- the caller batches it into the next endpoint -- while a
-    # conflict on the final endpoint is fatal. Exiting here denied the caller
-    # that choice, and annotating every conflict as ::error:: marked
-    # recoverable runs as failures, so severity belongs to the caller.
+    # Diagnose, but do NOT decide. A conflict while EXTENDING a unit is
+    # recoverable -- the caller keeps the original unit -- while a conflict on
+    # the primary selection is fatal. Exiting here denied the caller that
+    # choice, and annotating every conflict as ::error:: marked recoverable
+    # runs as failures, so severity belongs to whoever called us.
     echo "  merge conflict outside VERSION staging $SRC -> $TGT:"
     git ls-files -u | awk '{print "  " $4}' | sort -u
     return 2
@@ -137,47 +135,58 @@ stage_to() {
 picked=""
 picked_idx=0
 conflicted=0
+# The code returned by the LAST endpoint tried (the tip of $SRC when nothing
+# is picked). Only that one decides whether an unpicked run is a real
+# divergence: an early unit may conflict in isolation while the full merge is
+# a clean no-op, and that is "nothing to promote", not a conflict.
+last_rc=0
 for i in "${!units[@]}"; do
   sel_rc=0
   stage_to "${units[$i]}" || sel_rc=$?
+  last_rc="$sel_rc"
   if [ "$sel_rc" -eq 0 ]; then
     picked="${units[$i]}"
     picked_idx="$i"
     break
   fi
   if [ "$sel_rc" -eq 2 ]; then
-    # A conflicting unit is SKIPPED, not fatal. Units come from
-    # `rev-list --reverse --first-parent $TGT..$SRC` and stage_to builds "$TGT
-    # plus everything UP TO <endpoint>", so they are cumulative prefixes:
-    # units[i+1] is a strict SUPERSET of units[i]. Advancing batches the two
-    # together -- it cannot reorder or drop anything -- and the last endpoint
-    # is the tip of $SRC, so the loop still makes progress whenever $SRC as a
-    # whole is mergeable.
+    # A conflicting unit is SKIPPED, not fatal. This used to exit 1 on the
+    # reasoning that "promoting a later unit ahead of it would reorder the
+    # branch" -- but units come from `rev-list --reverse --first-parent
+    # $TGT..$SRC` and stage_to builds "$TGT plus everything UP TO <endpoint>",
+    # so they are cumulative prefixes. units[i+1] is a strict SUPERSET of
+    # units[i]: advancing batches the two together, it cannot reorder or drop
+    # anything. The last endpoint is the tip of $SRC -- the batched merge --
+    # so the loop still makes progress whenever $SRC as a whole is mergeable.
     #
-    # Treating this as fatal froze promotion for exactly the repos that needed
-    # it most: once AppBuilder committed a repair onto a promotion branch, $TGT
-    # held a change the OLD units predate, so the oldest outstanding unit
-    # conflicted against it forever -- even after a back-merge had made the
-    # full $SRC -> $TGT merge clean. tsa failed this way every run while
-    # `git merge origin/qa` into main succeeded by hand.
+    # Aborting here froze promotion for exactly the repos that needed it most.
+    # After AppBuilder committed a repair onto a promotion branch, $TGT gained
+    # a change that the OLD units predate, so the oldest outstanding unit
+    # conflicted against it forever -- even once a back-merge had made the full
+    # $SRC -> $TGT merge clean. tsa failed this way every run
+    # ("CONFLICT (content): Merge conflict in .github/workflows/promote.yml")
+    # while `git merge origin/qa` into main succeeded by hand.
     conflicted=1
     echo "::warning::unit ${units[$i]} conflicts against $TGT in isolation --" \
-         "batching it with the next unit"
+         "batching it forward with the following unit(s)"
     continue
   fi
   [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
 done
 
-# Every endpoint conflicted, including the tip of $SRC. That is a real
-# divergence a human must reconcile -- and it must NOT fall through to the
-# "Nothing to promote" branch below, which would report success while
-# promoting nothing.
-if [ -z "$picked" ] && [ "$conflicted" -eq 1 ]; then
+# The LAST endpoint -- the tip of $SRC -- conflicted. That is a real divergence
+# a human has to reconcile, distinct from "nothing to promote", which must not
+# be reported for it. Keying off the last code rather than the sticky
+# `conflicted` flag matters: an early unit can conflict in isolation while the
+# tip turns out to be a clean content no-op (rc 1) against $TGT, and that state
+# proves there is no divergence at all.
+if [ -z "$picked" ] && [ "$last_rc" -eq 2 ]; then
   echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand"
   exit 1
 fi
 
 if [ -z "$picked" ]; then
+  [ "$conflicted" -eq 1 ] && echo "  an earlier unit conflicted in isolation, but $SRC as a whole is a content no-op against $TGT"
   # Phrase the no-op with $LABEL: "Nothing to promote" is the string every
   # repo's promotion_selftest.sh matches on, so the forward direction must keep
   # saying exactly that, while the reverse direction still reads correctly
@@ -228,19 +237,26 @@ if [ "$SPLIT" = "1" ]; then
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
     else
-      # stage_to only returns 1 here (a conflict exits the script inside it).
-      # Not expected in practice: a superset of a real change is a real change.
-      echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
-      # The worktree is now staged against the WRONG endpoint, so the original
-      # unit has to be restaged before anything is committed. The restage's
-      # result is checked rather than discarded (|| true): if it did not
-      # reproduce a real change, bumping VERSION and committing would promote
-      # the wrong tree.
+      # stage_to is tri-state, so 1 and 2 must not be reported alike: 2 is a real
+      # merge conflict and 1 is a genuine no-op. Collapsing them printed "content
+      # no-op" over a conflict, which sent anyone reading the CI log looking for a
+      # VERSION-only diff that was never there.
+      if [ "$ext_rc" -eq 2 ]; then
+        echo "::warning::extension to ${units[$ext_idx]} conflicts against $TGT -- keeping unit $picked_idx"
+      else
+        # Cannot happen (a superset of a real change is a real change).
+        echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
+      fi
+      # The failed extension left the worktree staged against the WRONG endpoint,
+      # so the original unit has to be restaged before anything is committed.
+      # Discarding this exit code (|| true) defeated the fallback entirely: a
+      # restage that did not reproduce a real change left a half-staged or
+      # conflicted tree, and the script committed it anyway.
       re_rc=0
       stage_to "$picked" || re_rc=$?
       if [ "$re_rc" -ne 0 ]; then
-        echo "::error::restaging $picked after the failed extension produced no change --" \
-             "refusing to promote the wrong tree"
+        echo "::error::could not restage $picked after the failed extension (exit $re_rc) --" \
+             "refusing to promote a half-staged tree"
         exit 1
       fi
     fi
@@ -254,9 +270,7 @@ unit_subject="$(git log -1 --format=%s "$picked")"
 unit_pr="$(printf '%s' "$unit_subject" | sed -n 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p')"
 if [ -n "$unit_pr" ]; then
   body_first="$(git log -1 --format=%b "$picked" | sed -n '/./{p;q;}')"
-  if [ -n "$body_first" ]; then
-    unit_subject="$body_first"
-  fi
+  [ -n "$body_first" ] && unit_subject="$body_first"
 else
   # Squash merges land as "feat: thing (#123)".
   unit_pr="$(printf '%s' "$unit_subject" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
@@ -288,15 +302,13 @@ fi
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   before="$(cat "$f")"
-  python3 "${PROMOTE_TMPDIR:-$here}/bump_version.py" "$f" >/dev/null
+  python3 "$here/bump_version.py" "$f" >/dev/null
   echo "  $f: $before -> $(cat "$f")"
   git add "$f"
 done < <(version_files)
 
 subject="$LABEL: $SRC -> $TGT"
-if [ "$SPLIT" = "1" ] && [ -n "$unit_pr" ]; then
-  subject="$subject (#$unit_pr)"
-fi
+[ "$SPLIT" = "1" ] && [ -n "$unit_pr" ] && subject="$subject (#$unit_pr)"
 
 git commit -q -m "$subject" \
   -m "Code-only $LABEL. VERSION stays on ${TGT}'s own sequence, advanced one step here."
