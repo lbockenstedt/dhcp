@@ -34,18 +34,20 @@ from typing import Any, Dict, Iterable, List, Optional
 
 try:
     from kea_ha import (
-        DEFAULT_DESIRED_STATE, KeaHAConfigError, apply_order, build_node_config,
-        build_peers, coerce_mode, config_fingerprint, parse_ha_status,
-        resolve_hook_dir, summarize_ha,
+        DEFAULT_DESIRED_STATE, DEFAULT_DESIRED_STATE6, KeaHAConfigError,
+        apply_order, build_node_config, build_node_config6, build_peers,
+        coerce_mode, config_fingerprint, parse_ha_status, resolve_hook_dir,
+        summarize_ha,
     )
-    from kea_manager import build_subnet4
+    from kea_manager import build_subnet4, build_subnet6
 except ImportError:  # loaded as a package (src.X) by the sibling entrypoint
     from src.kea_ha import (  # type: ignore
-        DEFAULT_DESIRED_STATE, KeaHAConfigError, apply_order, build_node_config,
-        build_peers, coerce_mode, config_fingerprint, parse_ha_status,
-        resolve_hook_dir, summarize_ha,
+        DEFAULT_DESIRED_STATE, DEFAULT_DESIRED_STATE6, KeaHAConfigError,
+        apply_order, build_node_config, build_node_config6, build_peers,
+        coerce_mode, config_fingerprint, parse_ha_status, resolve_hook_dir,
+        summarize_ha,
     )
-    from src.kea_manager import build_subnet4  # type: ignore
+    from src.kea_manager import build_subnet4, build_subnet6  # type: ignore
 
 logger = logging.getLogger("KeaCluster")
 
@@ -59,8 +61,8 @@ class KeaHACoordinator:
     """
 
     def __init__(self, transport, mode: str = "", hook_dir: str = "",
-                 state_path: str = ""):
-        """Initialize the Kea cluster coordinator with transport, mode, and state path."""
+                 state_path: str = "", state_path6: str = ""):
+        """Initialize the Kea cluster coordinator with transport, mode, and state paths."""
         self.transport = transport
         self.mode = coerce_mode(mode)
         # Empty means "resolve on the node" — the multiarch triplet differs per
@@ -68,18 +70,32 @@ class KeaHACoordinator:
         self.hook_dir = hook_dir or ""
         self.state_path = state_path or os.getenv("LM_DHCP_DESIRED_STATE",
                                                   DEFAULT_DESIRED_STATE)
+        self.state_path6 = state_path6 or os.getenv("LM_DHCP_DESIRED_STATE6",
+                                                     DEFAULT_DESIRED_STATE6)
         #: Last COMMITTED shared intent — only ever advanced by a fully
         #: successful apply, so a failed transaction cannot poison the next one.
         self.desired: Dict[str, Any] = {"subnets": [], "reservations": []}
         self.version = 0
         self.last_apply: Dict[str, Any] = {}
+        #: The DHCPv6 mirror of the above. Kept fully separate: v4 and v6 are
+        #: independent Kea daemons/config trees with independent scopes and
+        #: independent versioning, so conflating them into one journal/version
+        #: would make a v6-only apply bump the v4 version (or vice versa) and
+        #: make crash-recovery ambiguous about which daemon a pending
+        #: candidate belongs to.
+        self.desired6: Dict[str, Any] = {"subnets": [], "reservations": []}
+        self.version6 = 0
+        self.last_apply6: Dict[str, Any] = {}
         #: A candidate journalled to disk but not yet promoted. Set on load when
         #: the process died mid-transaction; the pair may be running it, the
         #: committed record may be a version behind, and only a re-apply can
         #: resolve that. Surfaced in :meth:`report` until an apply clears it.
         self.pending_candidate: Optional[Dict[str, Any]] = None
+        self.pending_candidate6: Optional[Dict[str, Any]] = None
         self.config_digests: Dict[str, str] = {}
+        self.config_digests6: Dict[str, str] = {}
         self.ha_status: Dict[str, Dict[str, Any]] = {}
+        self.ha_status6: Dict[str, Dict[str, Any]] = {}
         #: Serializes the whole install→read→validate→apply transaction. Two
         #: concurrent syncs would otherwise interleave one's validate with the
         #: other's apply and leave the pair on a config neither node validated.
@@ -87,6 +103,7 @@ class KeaHACoordinator:
         #: which on 3.9-era loop semantics is outside any running loop.
         self._lock: Optional[asyncio.Lock] = None
         self._load_state()
+        self._load_state6()
 
     def _get_lock(self) -> asyncio.Lock:
         """Return or lazily create the transaction lock for this cluster."""
@@ -223,6 +240,104 @@ class KeaHACoordinator:
                          "%s — the next start will report a pending candidate",
                          self.state_path, e)
 
+    # ── Durable desired state (DHCPv6) ──────────────────────────────────────
+    # Exact mirror of the v4 methods above, against ``self.state_path6`` /
+    # ``self.desired6`` / ``self.version6`` / ``self.pending_candidate6``.
+
+    def _load_state6(self) -> None:
+        if not self.state_path6 or not os.path.exists(self.state_path6):
+            return
+        try:
+            with open(self.state_path6) as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError("desired state is not an object")
+            subnets = data.get("subnets")
+            reservations = data.get("reservations")
+            if not isinstance(subnets, list) or not isinstance(reservations, list):
+                raise ValueError("desired state subnets/reservations must be lists")
+            self.desired6 = {"subnets": subnets, "reservations": reservations}
+            self.version6 = int(data.get("version") or 0)
+            pending = data.get("pending")
+            if isinstance(pending, dict) and pending.get("version"):
+                self.pending_candidate6 = pending
+                logger.error(
+                    "DHCPv6 HA desired state carries an un-promoted candidate "
+                    "(v%s journalled at %s): the pair may be running it while "
+                    "the committed record is v%s. Re-apply to converge.",
+                    pending.get("version"), pending.get("started_at"),
+                    self.version6)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not load DHCPv6 desired state from %s: %s — "
+                           "starting with no committed intent",
+                           self.state_path6, e)
+            self.desired6 = {"subnets": [], "reservations": []}
+            self.version6 = 0
+            self.pending_candidate6 = None
+
+    def _write_state6(self, payload: Dict[str, Any]) -> None:
+        if not self.state_path6:
+            return
+        directory = os.path.dirname(self.state_path6)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = self.state_path6 + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.state_path6)
+
+    def _journal_candidate6(self, subnets: List[Any], reservations: List[Any],
+                            version: int) -> None:
+        self._write_state6({
+            "version": self.version6, "mode": self.mode,
+            "subnets": self.desired6.get("subnets") or [],
+            "reservations": self.desired6.get("reservations") or [],
+            "updated_at": time.time(),
+            "pending": {"version": version, "subnets": subnets,
+                        "reservations": reservations, "started_at": time.time()},
+        })
+
+    def _promote_candidate6(self, subnets: List[Any], reservations: List[Any],
+                            version: int) -> None:
+        self._write_state6({
+            "version": version, "mode": self.mode, "subnets": subnets,
+            "reservations": reservations, "updated_at": time.time(),
+            "pending": None,
+        })
+
+    def _retain_candidate6(self, version: int, unrestored: List[str]) -> None:
+        try:
+            self._write_state6({
+                "version": self.version6, "mode": self.mode,
+                "subnets": self.desired6.get("subnets") or [],
+                "reservations": self.desired6.get("reservations") or [],
+                "updated_at": time.time(),
+                "pending": {"version": version, "started_at": time.time(),
+                            "unrestored": list(unrestored),
+                            "subnets": self.desired6.get("subnets") or [],
+                            "reservations": self.desired6.get("reservations") or []},
+            })
+        except Exception as e:  # noqa: BLE001
+            logger.error("Could not retain the DHCPv6 HA candidate journal at "
+                         "%s: %s — a restart will not know %s may be ahead",
+                         self.state_path6, e, ", ".join(unrestored))
+
+    def _clear_candidate6(self) -> None:
+        try:
+            self._write_state6({
+                "version": self.version6, "mode": self.mode,
+                "subnets": self.desired6.get("subnets") or [],
+                "reservations": self.desired6.get("reservations") or [],
+                "updated_at": time.time(), "pending": None,
+            })
+            self.pending_candidate6 = None
+        except Exception as e:  # noqa: BLE001
+            logger.error("Could not clear the DHCPv6 HA candidate journal at "
+                         "%s: %s — the next start will report a pending "
+                         "candidate", self.state_path6, e)
+
     @property
     def enabled(self) -> bool:
         """Whether HA clustering is currently enabled on the transport."""
@@ -270,6 +385,42 @@ class KeaHACoordinator:
             "configs": configs,
             "order": apply_order(peers),
             "subnets": len(owned["subnet4"]),
+            "reservations": applied,
+            "reservations_skipped": skipped,
+            "digest": config_fingerprint(owned),
+        }
+
+    # ── Config rendering (DHCPv6) ────────────────────────────────────────────
+
+    def owned_config6(self, subnets: Iterable[Any],
+                      reservations: Iterable[Any]) -> Dict[str, Any]:
+        """The coordinator-owned DHCPv6 slice both nodes must share, identically."""
+        kea_subnets, applied, skipped = build_subnet6(list(subnets or []),
+                                                       list(reservations or []))
+        return {"subnet6": kea_subnets, "_applied": applied, "_skipped": skipped}
+
+    def render6(self, subnets: Iterable[Any], reservations: Iterable[Any],
+               node_configs: Optional[Dict[str, Dict[str, Any]]] = None
+               ) -> Dict[str, Any]:
+        """The DHCPv6 mirror of :meth:`render` — see there for the rationale.
+
+        ``node_configs`` maps member id → that node's CURRENT ``Dhcp6`` config.
+        """
+        peers = build_peers(self.members(), self.mode)
+        owned = self.owned_config6(subnets, reservations)
+        applied, skipped = owned.pop("_applied"), owned.pop("_skipped")
+        node_configs = node_configs or {}
+        configs = {
+            p["name"]: build_node_config6(node_configs.get(p["name"]) or {},
+                                          p["name"], peers, self.mode,
+                                          self.hook_dir, owned=owned)
+            for p in peers
+        }
+        return {
+            "peers": peers,
+            "configs": configs,
+            "order": apply_order(peers),
+            "subnets": len(owned["subnet6"]),
             "reservations": applied,
             "reservations_skipped": skipped,
             "digest": config_fingerprint(owned),
@@ -506,6 +657,217 @@ class KeaHACoordinator:
                              errors=errors, stage="apply",
                              rolled_back=rolled_back)
 
+    # ── Apply (DHCPv6) ───────────────────────────────────────────────────────
+    # Exact mirror of the v4 apply/_apply_locked/_rollback trio above, targeting
+    # the dhcp6 daemon's own RPCs (``KEAW_*6``), journal (``self.state_path6``)
+    # and version counter (``self.version6``) — kept as separate methods rather
+    # than parameterizing the v4 ones so this addition cannot change the
+    # behaviour of the already-proven v4 transaction.
+
+    async def apply6(self, subnets: Iterable[Any], reservations: Iterable[Any],
+                     timeout: float = 40.0) -> Dict[str, Any]:
+        """Serialized DHCPv6 transaction: hooks → read → validate both → apply."""
+        async with self._get_lock():
+            return await self._apply_locked6(list(subnets or []),
+                                             list(reservations or []), timeout)
+
+    async def mutate_reservation6(self, action: str, data: Dict[str, Any],
+                                  timeout: float = 40.0) -> Dict[str, Any]:
+        """The DHCPv6 mirror of :meth:`mutate_reservation`.
+
+        DHCPv6 reservations are keyed the same way as v4 in this codebase
+        (hw-address, via ``ip-addresses``/``ip`` — see ``build_subnet6``), so
+        the read-modify-write shape is identical; only the desired-state
+        object and version counter differ.
+        """
+        async with self._get_lock():
+            desired = self.desired6
+            if not desired.get("subnets"):
+                return {"status": "ERROR", "cluster": True, "message":
+                        "The HA pair has no synchronised DHCPv6 subnets yet — "
+                        "run a DHCPv6 sync before managing reservations."}
+            ip = data.get("ip")
+            if not ip:
+                return {"status": "ERROR", "cluster": True,
+                        "message": "ip is required"}
+            old_ip = data.get("old_ip") or ip
+            reservations = [r for r in (desired.get("reservations") or [])
+                            if r.get("ip") not in (old_ip, ip)]
+            if action != "delete":
+                mac = data.get("mac")
+                if not mac:
+                    return {"status": "ERROR", "cluster": True,
+                            "message": "mac is required"}
+                reservations.append({"ip": ip, "mac": mac,
+                                     "hostname": data.get("hostname", ""),
+                                     "subnet": data.get("subnet", "")})
+            return await self._apply_locked6(list(desired.get("subnets") or []),
+                                             reservations, timeout)
+
+    async def _apply_locked6(self, subnets: List[Any], reservations: List[Any],
+                             timeout: float) -> Dict[str, Any]:
+        try:
+            peers = self.peers()
+        except KeaHAConfigError as e:
+            return self._verdict6("ERROR", self._empty_plan([]), applied=[],
+                                  failed=[], errors={}, stage="topology",
+                                  message=str(e))
+        order: List[str] = apply_order(peers)
+
+        hooks = await self.transport.fanout(
+            "KEAW_INSTALL_HOOKS", {"hook_dir": self.hook_dir}, timeout=timeout)
+        missing = [mid for mid in order
+                   if ((hooks.get("results") or {}).get(mid) or {}).get("status") != "SUCCESS"]
+        if missing:
+            return self._verdict6("ERROR", self._empty_plan(order), applied=[],
+                                  failed=order, errors={
+                mid: ((((hooks.get("results") or {}).get(mid) or {}).get("message"))
+                      or "HA hook libraries unavailable") for mid in missing},
+                stage="install-hooks")
+
+        node_configs: Dict[str, Dict[str, Any]] = {}
+        read_errors: Dict[str, str] = {}
+        for member_id in order:
+            reply = await self.transport.call(member_id, "KEAW_GET_CONFIG6", {},
+                                              timeout=timeout)
+            cfg = reply.get("config") if isinstance(reply, dict) else None
+            if not isinstance(reply, dict) or reply.get("status") != "SUCCESS" \
+                    or not isinstance(cfg, dict):
+                read_errors[member_id] = (
+                    (reply or {}).get("message")
+                    or "could not read the running DHCPv6 configuration")
+                continue
+            node_configs[member_id] = cfg
+        if read_errors:
+            return self._verdict6("ERROR", self._empty_plan(order), applied=[],
+                                  failed=order, errors=read_errors,
+                                  stage="read-config")
+
+        try:
+            plan = self.render6(subnets, reservations, node_configs)
+        except KeaHAConfigError as e:
+            return self._verdict6("ERROR", self._empty_plan(order), applied=[],
+                                  failed=order, errors={}, stage="render",
+                                  message=str(e))
+        configs: Dict[str, Any] = plan["configs"]
+
+        validation_errors: Dict[str, str] = {}
+        for member_id in order:
+            reply = await self.transport.call(
+                member_id, "KEAW_VALIDATE6", {"config": configs[member_id]},
+                timeout=timeout)
+            if reply.get("status") != "SUCCESS":
+                validation_errors[member_id] = (
+                    reply.get("message") or "config-test rejected the DHCPv6 configuration")
+        if validation_errors:
+            return self._verdict6("ERROR", plan, applied=[], failed=order,
+                                  errors=validation_errors, stage="validate")
+
+        candidate_version = self.version6 + 1
+        try:
+            self._journal_candidate6(subnets, reservations, candidate_version)
+        except Exception as e:  # noqa: BLE001
+            return self._verdict6(
+                "ERROR", plan, applied=[], failed=order, stage="journal",
+                errors={"coordinator": f"could not journal the DHCPv6 candidate: {e}"})
+
+        applied: List[str] = []
+        errors: Dict[str, str] = {}
+        for member_id in order:
+            reply = await self.transport.call(
+                member_id, "KEAW_APPLY6",
+                {"config": configs[member_id], "version": candidate_version,
+                 "hook_dir": self.hook_dir},
+                timeout=timeout)
+            if reply.get("status") == "SUCCESS":
+                applied.append(member_id)
+                continue
+            errors[member_id] = reply.get("message") or "apply failed"
+            return await self._rollback6(order, applied, member_id, reply,
+                                         errors, plan, timeout)
+
+        try:
+            self._promote_candidate6(subnets, reservations, candidate_version)
+        except Exception as e:  # noqa: BLE001
+            errors = {"coordinator":
+                      f"both nodes applied DHCPv6 v{candidate_version} but the "
+                      f"coordinator could not persist it ({e}); rolling both "
+                      f"back to v{self.version6}"}
+            rolled_back = []
+            for node in list(applied):
+                undo = await self.transport.call(node, "KEAW_ROLLBACK6", {},
+                                                 timeout=timeout)
+                if undo.get("status") == "SUCCESS":
+                    rolled_back.append(node)
+                    self.config_digests6.pop(node, None)
+                else:
+                    errors[node] = (
+                        f"may still hold v{candidate_version} — rollback failed: "
+                        f"{undo.get('message') or 'unknown error'}")
+            remaining = [m for m in applied if m not in rolled_back]
+            if remaining:
+                self._retain_candidate6(candidate_version, remaining)
+                self.pending_candidate6 = {
+                    "version": candidate_version, "started_at": time.time(),
+                    "unrestored": list(remaining),
+                }
+                logger.error("Kea DHCPv6 HA promote failed and %s could not be "
+                             "rolled back — retaining the candidate journal",
+                             ", ".join(remaining))
+            else:
+                self._clear_candidate6()
+            return self._verdict6(
+                "ERROR" if not remaining else "PARTIAL", plan,
+                applied=remaining,
+                failed=[m for m in order if m not in remaining],
+                errors=errors, stage="promote", rolled_back=rolled_back)
+        self.version6 = candidate_version
+        self.desired6 = {"subnets": list(subnets), "reservations": list(reservations)}
+        self.pending_candidate6 = None
+        for member_id in applied:
+            self.config_digests6[member_id] = plan["digest"]
+        return self._verdict6("SUCCESS", plan, applied=applied, failed=[],
+                              errors={}, stage="apply")
+
+    async def _rollback6(self, order: List[str], applied: List[str],
+                         failed_member: str, reply: Dict[str, Any],
+                         errors: Dict[str, str], plan: Dict[str, Any],
+                         timeout: float) -> Dict[str, Any]:
+        """The DHCPv6 mirror of :meth:`_rollback` — see there for the rationale."""
+        suspect = list(applied)
+        if reply.get("mutated") is not False:
+            suspect.append(failed_member)
+        rolled_back: List[str] = []
+        for node in suspect:
+            undo = await self.transport.call(node, "KEAW_ROLLBACK6", {},
+                                             timeout=timeout)
+            if undo.get("status") == "SUCCESS":
+                rolled_back.append(node)
+                self.config_digests6.pop(node, None)
+            else:
+                errors[node] = (
+                    (errors.get(node, "") + "; " if errors.get(node) else "")
+                    + f"may still hold the new DHCPv6 configuration — rollback "
+                      f"failed: {undo.get('message') or 'unknown error'}")
+        remaining = [m for m in suspect if m not in rolled_back]
+        status = "ERROR" if not remaining else "PARTIAL"
+        if remaining:
+            self._retain_candidate6(self.version6 + 1, remaining)
+            self.pending_candidate6 = {
+                "version": self.version6 + 1,
+                "started_at": time.time(),
+                "unrestored": list(remaining),
+            }
+            logger.error("Kea DHCPv6 HA rollback incomplete — %s may still "
+                         "hold the candidate; the journal is retained for "
+                         "recovery", ", ".join(remaining))
+        else:
+            self._clear_candidate6()
+        return self._verdict6(status, plan, applied=remaining,
+                              failed=[m for m in order if m not in remaining],
+                              errors=errors, stage="apply",
+                              rolled_back=rolled_back)
+
     def _empty_plan(self, order: List[str]) -> Dict[str, Any]:
         """A plan placeholder for failures that abort before rendering."""
         return {"peers": [], "configs": {}, "order": list(order), "subnets": 0,
@@ -544,6 +906,41 @@ class KeaHACoordinator:
             logger.error("Kea HA apply %s at stage %s — applied=%s failed=%s",
                          status, stage, applied, failed)
         self.last_apply = verdict
+        return dict(verdict)
+
+    def _verdict6(self, status: str, plan: Dict[str, Any], applied: List[str],
+                  failed: List[str], errors: Dict[str, str], stage: str,
+                  rolled_back: Optional[List[str]] = None,
+                  message: str = "") -> Dict[str, Any]:
+        """The DHCPv6 mirror of :meth:`_verdict` — see there for the shape."""
+        verdict = {
+            "status": status,
+            "cluster": True,
+            "mode": self.mode,
+            "stage": stage,
+            "version": self.version6,
+            "applied": applied,
+            "failed": failed,
+            "errors": errors,
+            "rolled_back": rolled_back or [],
+            "order": plan["order"],
+            "subnets": plan["subnets"],
+            "reservations": plan["reservations"],
+            "reservations_skipped": plan["reservations_skipped"],
+            "digest": plan["digest"],
+            "at": time.time(),
+        }
+        if status != "SUCCESS":
+            nodes = ", ".join(failed) or "unknown"
+            err_details = "; ".join(f"{k}: {v}" for k, v in errors.items() if v)
+            detail_str = f" ({err_details})" if err_details else ""
+            verdict["message"] = message or (
+                f"Kea DHCPv6 HA {stage} failed on: {nodes}{detail_str}"
+                + (f"; rolled back {', '.join(rolled_back)}" if rolled_back else "")
+                + (f"; still applied on {', '.join(applied)}" if applied else ""))
+            logger.error("Kea DHCPv6 HA apply %s at stage %s — applied=%s failed=%s",
+                         status, stage, applied, failed)
+        self.last_apply6 = verdict
         return dict(verdict)
 
     # ── Status ──────────────────────────────────────────────────────────────
@@ -626,3 +1023,74 @@ class KeaHACoordinator:
         """Fetch fresh member HA states, compute consensus/digests, and return status dictionary."""
         await self.refresh_status()
         return {"status": "SUCCESS", **self.report()}
+
+    # ── Status (DHCPv6) ──────────────────────────────────────────────────────
+
+    async def refresh_status6(self, timeout: float = 15.0) -> Dict[str, Any]:
+        """The DHCPv6 mirror of :meth:`refresh_status`."""
+        fan = await self.transport.fanout("KEAW_HA_STATUS6", {}, timeout=timeout)
+        results = fan.get("results") or {}
+        self.ha_status6 = {}
+        for member_id, reply in results.items():
+            if not isinstance(reply, dict):
+                self.ha_status6[member_id] = {"status": "ERROR",
+                                              "message": "malformed reply"}
+                self.config_digests6.pop(member_id, None)
+                continue
+            record = dict(reply)
+            raw = reply.get("status_get")
+            if reply.get("status") == "SUCCESS" and isinstance(raw, dict):
+                record["ha"] = parse_ha_status(raw)
+            elif isinstance(reply.get("ha"), dict):
+                record["ha"] = reply["ha"]
+            if reply.get("status") == "SUCCESS" and reply.get("digest"):
+                self.config_digests6[member_id] = reply["digest"]
+            else:
+                self.config_digests6.pop(member_id, None)
+            self.ha_status6[member_id] = record
+        for member_id in list(self.config_digests6):
+            if member_id not in self.ha_status6:
+                self.config_digests6.pop(member_id, None)
+        return fan
+
+    def report6(self) -> Dict[str, Any]:
+        """The DHCPv6 mirror of :meth:`report`."""
+        try:
+            peers = self.peers()
+        except KeaHAConfigError as e:
+            return {"enabled": True, "mode": self.mode, "state": "invalid",
+                    "healthy": False, "updating": False, "updating_members": [],
+                    "serving": False, "serving_count": 0,
+                    "config_converged": False,
+                    "config_digests_missing": [m["id"] for m in self.members()],
+                    "peers": [], "members": [], "member_count": len(self.members()),
+                    "healthy_count": 0, "degraded": [], "unreachable": [],
+                    "last_apply": dict(self.last_apply6),
+                    "recommendations": [f"Kea DHCPv6 HA topology is invalid: {e}"]}
+        report = summarize_ha(self.mode, peers,
+                              list(self.transport.member_links()),
+                              self.ha_status6, self.config_digests6,
+                              self.last_apply6)
+        if self.pending_candidate6:
+            report["pending_candidate"] = {
+                "version": self.pending_candidate6.get("version"),
+                "started_at": self.pending_candidate6.get("started_at"),
+            }
+            report["healthy"] = False
+            report["updating"] = False
+            if report["state"] in ("healthy", "updating"):
+                report["state"] = "degraded"
+            unrestored = self.pending_candidate6.get("unrestored") or []
+            report["pending_candidate"]["unrestored"] = list(unrestored)
+            detail = (" These node(s) may still be running it: "
+                      + ", ".join(unrestored) + "." if unrestored else "")
+            report["recommendations"] = list(report["recommendations"]) + [
+                f"A DHCPv6 configuration v{self.pending_candidate6.get('version')} "
+                f"was journalled but never confirmed — the coordinator restarted "
+                f"mid-apply or a rollback did not complete.{detail} Re-apply the "
+                f"configuration to converge the pair."]
+        return report
+
+    async def status6(self) -> Dict[str, Any]:
+        await self.refresh_status6()
+        return {"status": "SUCCESS", **self.report6()}

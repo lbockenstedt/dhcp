@@ -45,6 +45,20 @@ DHCP_WORKER_OPS = (
     "KEAW_LIST_LEASES",    # lease4-get-all
     "KEAW_LIST_RES",       # static reservations across subnets
     "KEAW_DEL_LEASE",      # delete active lease by IP
+    # ── DHCPv6 (dual-stack) mirrors of the ops above, against the separate
+    # kea-dhcp6 daemon. Required here: this tuple is the coordinator→worker
+    # op allowlist handed to ClusterCoordinator, so an op missing from it can
+    # never be issued and the whole v6 HA path would be dead.
+    "KEAW_GET_CONFIG6",    # read this node's FULL running Dhcp6 config
+    "KEAW_VALIDATE6",      # config-test a candidate Dhcp6 node config
+    "KEAW_APPLY6",         # snapshot + config-set + config-write (Dhcp6)
+    "KEAW_ROLLBACK6",      # restore the pre-apply6 snapshot
+    "KEAW_STANDDOWN6",     # leave the pair: strip the HA hooks (Dhcp6)
+    "KEAW_HA_STATUS6",     # status-get (dhcp6) → HA state + lease sync
+    "KEAW_LIST_SUBNETS6",  # subnet6-list
+    "KEAW_LIST_LEASES6",   # lease6-get-all
+    "KEAW_LIST_RES6",      # static DHCPv6 reservations across subnets
+    "KEAW_DEL_LEASE6",     # delete active DHCPv6 lease by address/MAC
     "KEAW_DIAGNOSTICS",    # full local diagnostics evidence
     "KEAW_STATS",          # statistic-get-all
 )
@@ -73,6 +87,11 @@ HOOK_DIR_GLOBS = ("/usr/lib/*/kea/hooks", "/usr/lib/kea/hooks",
 
 DEFAULT_CLUSTER_CONFIG = "/etc/lm-dhcp/cluster.json"
 DEFAULT_DESIRED_STATE = "/var/lib/lm-dhcp/desired.json"
+#: DHCPv6's own journal — kept in a SEPARATE file from the v4 one because the
+#: two daemons are independent config trees with independent versions; sharing
+#: one journal would conflate a v4-only apply with a v6-only apply and make a
+#: crash-recovery "pending" block ambiguous about which daemon it belongs to.
+DEFAULT_DESIRED_STATE6 = "/var/lib/lm-dhcp/desired6.json"
 
 #: The node-local Kea Control Agent stays LOOPBACK-ONLY (unauthenticated by
 #: default), so nothing but the co-located worker can drive Kea. HA peer traffic
@@ -369,6 +388,40 @@ def build_node_config(node_dhcp4: Dict[str, Any], this_name: str,
     """
     cfg = copy.deepcopy(node_dhcp4 or {})
     for key in COORDINATOR_OWNED_KEYS:
+        if owned is not None and key in owned:
+            cfg[key] = copy.deepcopy(owned[key])
+    keep = [h for h in (cfg.get("hooks-libraries") or [])
+            if isinstance(h, dict)
+            and not str(h.get("library", "")).endswith(
+                ("libdhcp_ha.so", "libdhcp_lease_cmds.so"))]
+    cfg["hooks-libraries"] = keep + build_ha_hooks(this_name, peers, mode, hook_dir)
+    return cfg
+
+
+#: The DHCPv6 mirror of :data:`COORDINATOR_OWNED_KEYS`. Kea's dhcp4/dhcp6 are
+#: independent daemons/config trees, so the coordinator-owned key here is
+#: ``subnet6`` (not ``subnet4``); everything else about ``Dhcp6`` — same as
+#: ``Dhcp4`` — belongs to the node.
+COORDINATOR_OWNED_KEYS6 = ("subnet6",)
+
+
+def build_node_config6(node_dhcp6: Dict[str, Any], this_name: str,
+                       peers: List[Dict[str, Any]], mode: str,
+                       hook_dir: str = "",
+                       owned: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Node-specific ``Dhcp6`` config, the DHCPv6 mirror of
+    :func:`build_node_config`.
+
+    The HA hook itself (``libdhcp_ha.so``) is architecturally identical for
+    dhcp4 and dhcp6 — same shared object, same ``high-availability`` parameter
+    shape, same peer URLs (each peer's HA hook dials the SAME partner control
+    agent regardless of which daemon is asking; the control agent multiplexes
+    by ``service``). Only the coordinator-owned key (``subnet6`` vs
+    ``subnet4``) and the config tree it is applied to differ, so ``peers`` and
+    :func:`build_ha_hooks` are reused verbatim from the v4 path.
+    """
+    cfg = copy.deepcopy(node_dhcp6 or {})
+    for key in COORDINATOR_OWNED_KEYS6:
         if owned is not None and key in owned:
             cfg[key] = copy.deepcopy(owned[key])
     keep = [h for h in (cfg.get("hooks-libraries") or [])
