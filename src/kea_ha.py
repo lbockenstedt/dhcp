@@ -61,6 +61,8 @@ DHCP_WORKER_OPS = (
     "KEAW_DEL_LEASE6",     # delete active DHCPv6 lease by address/MAC
     "KEAW_DIAGNOSTICS",    # full local diagnostics evidence
     "KEAW_STATS",          # statistic-get-all
+    "KEAW_DNS_HOOK_CONFIG",  # enable/update/disable the real-time DNS run_script hook
+    "KEAW_DNS_HOOK_STATUS",  # on-disk hook settings + running-config + log tail
 )
 
 HOT_STANDBY = "hot-standby"
