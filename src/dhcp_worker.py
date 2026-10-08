@@ -894,6 +894,19 @@ class DhcpWorkerOps:
         """``KEAW_STATS`` — query local Kea performance and packet statistics."""
         return self.mgr.get_stats()
 
+    def dns_hook_config(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_DNS_HOOK_CONFIG`` — enable/update/disable the real-time
+        Kea -> Unbound run_script hook on THIS node."""
+        settings = data.get("settings")
+        if not isinstance(settings, dict):
+            return {"status": "ERROR", "message": "settings object is required"}
+        return self.mgr.configure_dns_hook(settings, hook_dir=data.get("hook_dir") or "")
+
+    def dns_hook_status(self, _data: Dict[str, Any]) -> Dict[str, Any]:
+        """``KEAW_DNS_HOOK_STATUS`` — this node's on-disk hook settings, whether
+        the running Kea config currently loads it, and a log tail."""
+        return {"status": "SUCCESS", **self.mgr.dns_hook_status()}
+
     def op_table(self) -> Dict[str, Any]:
         """Map KEAW operations to bound handler methods."""
         return {
@@ -921,6 +934,8 @@ class DhcpWorkerOps:
             "KEAW_DEL_LEASE6": self.delete_lease6,
             "KEAW_DIAGNOSTICS": self.diagnostics,
             "KEAW_STATS": self.stats,
+            "KEAW_DNS_HOOK_CONFIG": self.dns_hook_config,
+            "KEAW_DNS_HOOK_STATUS": self.dns_hook_status,
         }
 
 
