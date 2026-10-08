@@ -152,6 +152,8 @@ class DHCPSpoke(BaseSpoke):
       DHCP_DEL_RES6      — remove a static DHCPv6 reservation by address
       DHCP_HA_STATUS6    — HA member state for the DHCPv6 daemon
       DHCP_HA_APPLY6     — re-apply the current desired DHCPv6 config to both nodes
+      DHCP_DNS_HOOK_CONFIG — enable/update/disable the real-time Kea -> Unbound hook
+      DHCP_DNS_HOOK_STATUS — real-time DNS hook settings + log tail
     """
 
     def __init__(self, spoke_id: str, config: Dict[str, Any]):
@@ -832,6 +834,34 @@ class DHCPSpoke(BaseSpoke):
             errors["cluster"] = reply.get("message") or "no node answered the lease purge"
         return sorted(purged), errors
 
+    async def _ha_dns_hook_config(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply the same real-time DNS hook settings to EVERY node of the
+        pair (it's a per-node local-config mutation, like a reservation, not
+        part of the shared subnet4/reservations desired-state blob the
+        coordinator's transaction lock guards)."""
+        settings = data.get("settings")
+        if not isinstance(settings, dict):
+            return {"status": "ERROR", "message": "settings object is required"}
+        fan = await self.cluster.transport.fanout(
+            "KEAW_DNS_HOOK_CONFIG", {"settings": settings, "hook_dir": data.get("hook_dir") or ""},
+            timeout=20.0)
+        results = fan.get("results") or {}
+        errors = {m: (r or {}).get("message") for m, r in results.items()
+                  if not isinstance(r, dict) or r.get("status") not in ("SUCCESS", "PARTIAL")}
+        if not results:
+            return {"status": "ERROR", "message": fan.get("message") or "no node answered"}
+        status = "ERROR" if errors else (
+            "PARTIAL" if any((r or {}).get("status") == "PARTIAL" for r in results.values())
+            else "SUCCESS")
+        return {"status": status, "results": results, "member_errors": errors}
+
+    async def _ha_dns_hook_status(self) -> Dict[str, Any]:
+        """Per-node hook settings/log tail — NOT merged (unlike ``_ha_list``),
+        because drift between nodes (one enabled, one not) is exactly what an
+        operator needs to see here."""
+        fan = await self.cluster.transport.fanout("KEAW_DNS_HOOK_STATUS", {}, timeout=15.0)
+        return {"status": "SUCCESS", "members": fan.get("results") or {}}
+
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch incoming spoke command to corresponding local or cluster handler."""
         cmd = command_type.upper()
@@ -960,6 +990,10 @@ class DHCPSpoke(BaseSpoke):
                 return await self._ha_diagnostics()
             if cmd == "DHCP_STATS":
                 return await self._ha_stats()
+            if cmd == "DHCP_DNS_HOOK_CONFIG":
+                return await self._ha_dns_hook_config(data)
+            if cmd == "DHCP_DNS_HOOK_STATUS":
+                return await self._ha_dns_hook_status()
             if cmd == "DHCP_STATUS":
                 report = await self.cluster.status()
                 return {"status": "SUCCESS",
@@ -1087,6 +1121,17 @@ class DHCPSpoke(BaseSpoke):
 
         if cmd == "DHCP_STATS":
             return await asyncio.to_thread(self.mgr.get_stats)
+
+        if cmd == "DHCP_DNS_HOOK_CONFIG":
+            settings = data.get("settings")
+            if not isinstance(settings, dict):
+                return {"status": "ERROR", "message": "settings object is required"}
+            return await asyncio.to_thread(self.mgr.configure_dns_hook, settings,
+                                           data.get("hook_dir") or "")
+
+        if cmd == "DHCP_DNS_HOOK_STATUS":
+            status = await asyncio.to_thread(self.mgr.dns_hook_status)
+            return {"status": "SUCCESS", **status}
 
         return {"status": "ERROR", "error": f"Unknown command: {command_type}"}
 
