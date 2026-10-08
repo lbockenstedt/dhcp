@@ -66,10 +66,38 @@ _DEFAULT_HOOK_DIR = "/usr/lib/x86_64-linux-gnu/kea/hooks"
 NAME_RE = re.compile(r"^(?!-)[A-Za-z0-9_-]{1,63}(?<!-)"
                     r"(?:\.(?!-)[A-Za-z0-9_-]{1,63}(?<!-))*\.?$")
 
+#: Strict ``host@port`` allowlist for unbound-control targets. The generated
+#: script no longer ``eval``s these values (see ``_SCRIPT_TEMPLATE``), but
+#: this stays as defense-in-depth: it also rejects characters ($, backticks,
+#: parens, pipes, &) that have no business in a hostname/IP@port pair even
+#: when they're handled safely downstream.
+TARGET_RE = re.compile(r"^[A-Za-z0-9:](?:[A-Za-z0-9_.:-]{0,253}[A-Za-z0-9:])?@[0-9]{1,5}$")
+
 DEFAULT_TTL = 300
 MIN_TTL = 1
 MAX_TTL = 604800
 DEFAULT_TARGETS = ["127.0.0.1@8953"]
+
+
+def _as_bool(value: Any, field: str) -> bool:
+    """Strict bool coercion — ``bool("false")`` is ``True`` in Python, which
+    would silently turn a caller's intended "disable" into "enable". JSON
+    booleans/Python bools pass straight through; a small set of case-
+    insensitive string/int spellings are accepted for API callers that
+    serialize loosely; anything else is rejected rather than guessed at.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value in (0, 1):
+            return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off", ""):
+            return False
+    raise DnsHookConfigError(f"{field} must be a boolean, got {value!r}")
 
 
 class DnsHookConfigError(ValueError):
@@ -86,7 +114,7 @@ def validate_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(settings, dict):
         raise DnsHookConfigError("settings must be an object")
     out = default_settings()
-    out["enabled"] = bool(settings.get("enabled", False))
+    out["enabled"] = _as_bool(settings.get("enabled", False), "enabled")
     domain = str(settings.get("domain", "") or "").strip().rstrip(".").lower()
     if domain and not NAME_RE.match(domain):
         raise DnsHookConfigError(f"domain '{domain}' is not a valid DNS suffix")
@@ -98,7 +126,7 @@ def validate_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     if not (MIN_TTL <= ttl <= MAX_TTL):
         raise DnsHookConfigError(f"ttl must be between {MIN_TTL} and {MAX_TTL}")
     out["ttl"] = ttl
-    out["register_ptr"] = bool(settings.get("register_ptr", False))
+    out["register_ptr"] = _as_bool(settings.get("register_ptr", False), "register_ptr")
     targets = settings.get("targets")
     if targets is None:
         targets = list(DEFAULT_TARGETS)
@@ -107,12 +135,14 @@ def validate_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     clean_targets: List[str] = []
     for t in targets:
         t = str(t or "").strip()
-        if not t or any(c in t for c in ('"', "'", "\n", "\r", ";", " ")):
+        # Strict allowlist, not a blocklist: the old quote/semicolon/
+        # whitespace blocklist let shell-metacharacters like $(), backticks,
+        # |, & through, which the (now-removed) eval of this value in the
+        # generated script would have executed as code.
+        if not TARGET_RE.match(t):
             raise DnsHookConfigError(f"invalid unbound-control target: {t!r}")
         clean_targets.append(t)
     out["targets"] = clean_targets
-    if out["enabled"] and not clean_targets:
-        raise DnsHookConfigError("at least one DNS target is required when enabled")
     return out
 
 
@@ -186,7 +216,23 @@ log() {{ echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') [$HOOK] $*" >> "$LOG" 2>/dev/nul
 
 [ -r "$CONFIG" ] || exit 0
 
-CFG_LINES=$(python3 - "$CONFIG" 2>>"$LOG" <<'PY'
+# No `eval` of config-derived data: the python helper below emits one
+# KEY=value/TARGET: line per field and bash parses them with plain string
+# matching, so nothing from the JSON sidecar is ever interpreted as shell
+# syntax (shell metacharacters in a target are now also rejected up front by
+# kea_dns_hook.py's TARGET_RE, but this keeps the script safe even if that
+# validation were ever bypassed).
+ENABLED=false DOMAIN= TTL=300 REGISTER_PTR=false
+TARGETS=()
+while IFS= read -r _line; do
+    case "$_line" in
+        ENABLED=*) ENABLED="${{_line#ENABLED=}}" ;;
+        DOMAIN=*) DOMAIN="${{_line#DOMAIN=}}" ;;
+        TTL=*) TTL="${{_line#TTL=}}" ;;
+        REGISTER_PTR=*) REGISTER_PTR="${{_line#REGISTER_PTR=}}" ;;
+        TARGET:*) TARGETS+=("${{_line#TARGET:}}") ;;
+    esac
+done < <(python3 - "$CONFIG" 2>>"$LOG" <<'PY'
 import json, sys
 try:
     with open(sys.argv[1]) as fh:
@@ -198,11 +244,10 @@ print(f"ENABLED={{'true' if c.get('enabled') else 'false'}}")
 print(f"DOMAIN={{c.get('domain', '')}}")
 print(f"TTL={{int(c.get('ttl', 300) or 300)}}")
 print(f"REGISTER_PTR={{'true' if c.get('register_ptr') else 'false'}}")
-targets = c.get('targets') or ['127.0.0.1@8953']
-print("TARGETS=(" + " ".join('"%s"' % t for t in targets) + ")")
+for t in (c.get('targets') or ['127.0.0.1@8953']):
+    print(f"TARGET:{{t}}")
 PY
 )
-eval "$CFG_LINES"
 [ "${{ENABLED:-false}}" = "true" ] || exit 0
 [ "${{#TARGETS[@]}}" -eq 0 ] && TARGETS=("127.0.0.1@8953")
 
@@ -224,50 +269,83 @@ _ptr_name() {{
     printf '%s.%s.%s.%s.in-addr.arpa.' "$d" "$c" "$b" "$a"
 }}
 
+# Returns 0 only if EVERY target accepted the command, 2 if some (but not
+# all) did, 1 if none did — a multi-resolver deployment where only one
+# resolver got the update must not be logged as a clean success, which would
+# hide DNS drift across the fleet's resolvers.
 _uc() {{
-    local ok=1 t
+    local total=0 ok_count=0 t
     for t in "${{TARGETS[@]}}"; do
-        if unbound-control -s "$t" "$@" >/dev/null 2>>"$LOG"; then ok=0; fi
+        total=$((total+1))
+        unbound-control -s "$t" "$@" >/dev/null 2>>"$LOG" && ok_count=$((ok_count+1))
     done
-    return $ok
+    [ "$total" -eq 0 ] && return 1
+    [ "$ok_count" -eq "$total" ] && return 0
+    [ "$ok_count" -gt 0 ] && return 2
+    return 1
+}}
+
+_log_uc_result() {{
+    local rc="$1" label="$2"
+    case "$rc" in
+        0) log "$label" ;;
+        2) log "PARTIAL $label (not all resolvers accepted)" ;;
+        *) log "FAILED $label" ;;
+    esac
 }}
 
 add_record() {{
-    local ip="$1" fqdn
+    local ip="$1" fqdn rc
     fqdn=$(_fqdn "$2") || {{ log "skip $ip — no usable hostname"; return; }}
-    _uc local_data "${{fqdn}}. ${{TTL}} IN A ${{ip}}" && log "A  ${{fqdn}}. -> ${{ip}}"
+    _uc local_data "${{fqdn}}. ${{TTL}} IN A ${{ip}}"; rc=$?
+    _log_uc_result "$rc" "A  ${{fqdn}}. -> ${{ip}}"
     if [ "${{REGISTER_PTR:-false}}" = "true" ]; then
         local ptr; ptr=$(_ptr_name "$ip") || return
-        _uc local_data "${{ptr}} ${{TTL}} IN PTR ${{fqdn}}." && log "PTR ${{ptr}} -> ${{fqdn}}."
+        _uc local_data "${{ptr}} ${{TTL}} IN PTR ${{fqdn}}."; rc=$?
+        _log_uc_result "$rc" "PTR ${{ptr}} -> ${{fqdn}}."
     fi
 }}
 
 remove_record() {{
-    local ip="$1" fqdn
-    fqdn=$(_fqdn "$2") || return
-    _uc local_data_remove "${{fqdn}}." && log "removed A ${{fqdn}}."
+    local ip="$1" fqdn rc
+    # PTR removal only needs the IP (the reverse-zone name is derived from
+    # it, not from the hostname), so it must not be skipped just because
+    # this event's hostname field is empty/unparseable — that would leave a
+    # stale PTR behind forever on e.g. a release with a blank hostname.
     if [ "${{REGISTER_PTR:-false}}" = "true" ]; then
-        local ptr; ptr=$(_ptr_name "$ip") || return
-        _uc local_data_remove "$ptr" && log "removed PTR ${{ptr}}"
+        local ptr
+        if ptr=$(_ptr_name "$ip"); then
+            _uc local_data_remove "$ptr"; rc=$?
+            _log_uc_result "$rc" "removed PTR ${{ptr}}"
+        fi
     fi
+    fqdn=$(_fqdn "$2") || return
+    _uc local_data_remove "${{fqdn}}."; rc=$?
+    _log_uc_result "$rc" "removed A ${{fqdn}}."
 }}
 
 case "$HOOK" in
   leases4_committed)
-    n="${{LEASES4_SIZE:-0}}"
-    if [ "$n" -gt 0 ] 2>/dev/null; then
-        for i in $(seq 0 $((n-1))); do
-            eval "ip=\\${{LEASES4_AT${{i}}_ADDRESS:-}}"
-            eval "host=\\${{LEASES4_AT${{i}}_HOSTNAME:-}}"
-            [ -n "$ip" ] && add_record "$ip" "$host"
-        done
-    fi
+    # Deletions first, then additions: in the same leases4_committed batch a
+    # freed lease's hostname can be immediately reused by a newly-committed
+    # one (e.g. a client moving IPs). Removing first means a shared-hostname
+    # add always wins and survives; the old add-then-remove order could let
+    # the removal of the stale lease wipe out the record the new lease just
+    # registered.
     d="${{DELETED_LEASES4_SIZE:-0}}"
     if [ "$d" -gt 0 ] 2>/dev/null; then
         for i in $(seq 0 $((d-1))); do
-            eval "ip=\\${{DELETED_LEASES4_AT${{i}}_ADDRESS:-}}"
-            eval "host=\\${{DELETED_LEASES4_AT${{i}}_HOSTNAME:-}}"
+            addrvar="DELETED_LEASES4_AT${{i}}_ADDRESS"; hostvar="DELETED_LEASES4_AT${{i}}_HOSTNAME"
+            ip="${{!addrvar:-}}"; host="${{!hostvar:-}}"
             [ -n "$ip" ] && remove_record "$ip" "$host"
+        done
+    fi
+    n="${{LEASES4_SIZE:-0}}"
+    if [ "$n" -gt 0 ] 2>/dev/null; then
+        for i in $(seq 0 $((n-1))); do
+            addrvar="LEASES4_AT${{i}}_ADDRESS"; hostvar="LEASES4_AT${{i}}_HOSTNAME"
+            ip="${{!addrvar:-}}"; host="${{!hostvar:-}}"
+            [ -n "$ip" ] && add_record "$ip" "$host"
         done
     fi
     ;;
@@ -317,7 +395,36 @@ def write_hook_files(settings: Dict[str, Any]) -> None:
     os.chmod(DNS_HOOK_SCRIPT_PATH, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP
             | stat.S_IROTH | stat.S_IXOTH)  # 0755 — Kea execs it as itself
 
-    os.makedirs(os.path.dirname(DNS_HOOK_LOG_PATH), exist_ok=True)
+    _ensure_kea_writable_log_dir()
+
+
+def _ensure_kea_writable_log_dir() -> None:
+    """Create ``/var/log/kea`` (if missing) group-owned by ``_kea`` and
+    group-writable, the same convention ``dhcp_worker.py`` already uses for
+    ``/etc/kea/ha-tls`` and ``kea-dhcp4.conf``.
+
+    The hook script itself runs as the Kea daemon user, not as whoever calls
+    ``write_hook_files`` (typically root, via the control-plane). Without
+    this, a fresh/clean install leaves the directory root:root 0755: the
+    script's own ``mkdir -p``/``>>`` redirects into it then fail silently
+    (stderr is only ever redirected INTO this same log), so the entire hook
+    becomes a silent no-op with no error visible anywhere.
+    """
+    log_dir = os.path.dirname(DNS_HOOK_LOG_PATH)
+    os.makedirs(log_dir, exist_ok=True)
+    try:
+        import grp
+        kea_gid = grp.getgrnam("_kea").gr_gid
+    except (ImportError, KeyError, OSError):
+        return  # not a packaged/_kea install — nothing to chown to
+    try:
+        os.chown(log_dir, -1, kea_gid)
+        os.chmod(log_dir, 0o2775)  # setgid so new files inherit the _kea group
+        if os.path.isfile(DNS_HOOK_LOG_PATH):
+            os.chown(DNS_HOOK_LOG_PATH, -1, kea_gid)
+            os.chmod(DNS_HOOK_LOG_PATH, 0o664)
+    except OSError as e:  # noqa: BLE001
+        logger.warning("could not group-own %s to _kea: %s", log_dir, e)
 
 
 def read_status() -> Dict[str, Any]:

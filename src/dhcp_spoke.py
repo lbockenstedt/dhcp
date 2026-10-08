@@ -838,7 +838,15 @@ class DHCPSpoke(BaseSpoke):
         """Apply the same real-time DNS hook settings to EVERY node of the
         pair (it's a per-node local-config mutation, like a reservation, not
         part of the shared subnet4/reservations desired-state blob the
-        coordinator's transaction lock guards)."""
+        coordinator's transaction lock guards).
+
+        ``status`` is ERROR unless EVERY expected member answered SUCCESS — a
+        member that never answers at all (dropped by the fanout entirely,
+        e.g. a disconnected node) is just as dangerous as one that replies
+        with ERROR, since both leave the pair applying different settings, so
+        a missing member counts against ``status`` exactly like an errored
+        one instead of being silently absent from the count.
+        """
         settings = data.get("settings")
         if not isinstance(settings, dict):
             return {"status": "ERROR", "message": "settings object is required"}
@@ -846,21 +854,39 @@ class DHCPSpoke(BaseSpoke):
             "KEAW_DNS_HOOK_CONFIG", {"settings": settings, "hook_dir": data.get("hook_dir") or ""},
             timeout=20.0)
         results = fan.get("results") or {}
-        errors = {m: (r or {}).get("message") for m, r in results.items()
-                  if not isinstance(r, dict) or r.get("status") not in ("SUCCESS", "PARTIAL")}
-        if not results:
+        if not results and fan.get("status") == "ERROR":
             return {"status": "ERROR", "message": fan.get("message") or "no node answered"}
-        status = "ERROR" if errors else (
-            "PARTIAL" if any((r or {}).get("status") == "PARTIAL" for r in results.values())
-            else "SUCCESS")
+        expected = set(getattr(self.cluster.transport, "member_ids", lambda: [])() or []) | set(results.keys())
+        ok_ids = {m for m, r in results.items()
+                  if isinstance(r, dict) and r.get("status") == "SUCCESS"}
+        errors = {m: ((results.get(m) or {}).get("message") or "no response")
+                  for m in sorted(expected - ok_ids)}
+        status = "ERROR" if errors else "SUCCESS"
         return {"status": status, "results": results, "member_errors": errors}
 
     async def _ha_dns_hook_status(self) -> Dict[str, Any]:
         """Per-node hook settings/log tail — NOT merged (unlike ``_ha_list``),
         because drift between nodes (one enabled, one not) is exactly what an
-        operator needs to see here."""
+        operator needs to see here.
+
+        Unlike a plain read, ``status`` here is NOT unconditionally SUCCESS:
+        a member that never answers is surfaced in ``member_errors`` and
+        drags the overall status to ERROR, the same convention as
+        ``_ha_dns_hook_config``, so a caller can't mistake "half the pair
+        didn't respond" for a clean status read.
+        """
         fan = await self.cluster.transport.fanout("KEAW_DNS_HOOK_STATUS", {}, timeout=15.0)
-        return {"status": "SUCCESS", "members": fan.get("results") or {}}
+        results = fan.get("results") or {}
+        if not results and fan.get("status") == "ERROR":
+            return {"status": "ERROR", "members": {},
+                    "message": fan.get("message") or "no node answered"}
+        expected = set(getattr(self.cluster.transport, "member_ids", lambda: [])() or []) | set(results.keys())
+        ok_ids = {m for m, r in results.items()
+                  if isinstance(r, dict) and r.get("status") == "SUCCESS"}
+        missing = sorted(expected - ok_ids)
+        status = "ERROR" if missing else "SUCCESS"
+        return {"status": status, "members": results,
+                "member_errors": {m: "no response" for m in missing}}
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch incoming spoke command to corresponding local or cluster handler."""

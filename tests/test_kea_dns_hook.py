@@ -50,6 +50,44 @@ def test_validate_settings_rejects_bad_domain_and_injection_in_targets():
         h.validate_settings({"targets": "not-a-list"})
 
 
+@pytest.mark.parametrize("target", [
+    "$(touch /tmp/pwned)@8953",
+    "127.0.0.1@8953`id`",
+    "127.0.0.1@8953|id",
+    "127.0.0.1@8953&id",
+    "host(name)@8953",
+    "127.0.0.1",        # missing @port entirely
+    "127.0.0.1@",       # missing port
+    "@8953",            # missing host
+])
+def test_validate_settings_strict_target_regex_rejects_shell_metacharacters(target):
+    """The old blocklist only rejected quotes/semicolons/whitespace/newlines
+    — ``$()``, backticks, ``|`` and ``&`` all passed it and would have run as
+    shell code via the (now-removed) ``eval`` of this value in the generated
+    script. The allowlist regex must reject all of these outright."""
+    with pytest.raises(h.DnsHookConfigError):
+        h.validate_settings({"targets": [target]})
+
+
+def test_validate_settings_accepts_hostnames_and_ipv6_targets():
+    clean = h.validate_settings({"targets": ["unbound-1.lab.local@8953", "::1@8953"]})
+    assert clean["targets"] == ["unbound-1.lab.local@8953", "::1@8953"]
+
+
+def test_validate_settings_boolean_coercion_rejects_falsy_strings():
+    """``bool("false")`` is ``True`` in Python — a caller sending the JSON
+    string "false" to disable the hook must not silently enable it."""
+    clean = h.validate_settings({"enabled": "false", "register_ptr": "false"})
+    assert clean["enabled"] is False
+    assert clean["register_ptr"] is False
+
+    clean = h.validate_settings({"enabled": "true"})
+    assert clean["enabled"] is True
+
+    with pytest.raises(h.DnsHookConfigError):
+        h.validate_settings({"enabled": "maybe"})
+
+
 def test_validate_settings_not_a_dict():
     with pytest.raises(h.DnsHookConfigError):
         h.validate_settings("nope")
@@ -168,6 +206,122 @@ def test_script_registers_and_retracts_records_via_fake_unbound_control(tmp_path
     assert r.returncode == 0
     assert calls_log.read_text().strip() == ""
     assert not (tmp_path / "PWNED").exists()
+
+
+@pytest.mark.skipif(not _bash_available(), reason="bash not available")
+def test_script_processes_deletions_before_additions_same_batch(tmp_path):
+    """A deleted lease and a newly-committed lease sharing the same hostname
+    (e.g. a client moving IPs within one leases4_committed transaction) must
+    leave the NEW lease's record in place — the delete must run first so the
+    later add isn't the one that gets wiped."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls_log = tmp_path / "calls.log"
+    uc = bin_dir / "unbound-control"
+    uc.write_text(f'#!/bin/bash\necho "$*" >> "{calls_log}"\nexit 0\n')
+    uc.chmod(0o755)
+
+    config = tmp_path / "hook.json"
+    config.write_text(
+        '{"enabled": true, "targets": ["127.0.0.1@8953"], '
+        '"domain": "lab.local", "ttl": 300, "register_ptr": false}')
+    log_path = tmp_path / "hook.log"
+    body = h.render_script().replace(
+        h.DNS_HOOK_CONFIG_PATH, str(config)).replace(
+        h.DNS_HOOK_LOG_PATH, str(log_path))
+    script = tmp_path / "lm-dns-sync.sh"
+    script.write_text(body)
+    script.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env.update({
+        "LEASES4_SIZE": "1", "LEASES4_AT0_ADDRESS": "192.168.1.99",
+        "LEASES4_AT0_HOSTNAME": "samehost",
+        "DELETED_LEASES4_SIZE": "1", "DELETED_LEASES4_AT0_ADDRESS": "192.168.1.98",
+        "DELETED_LEASES4_AT0_HOSTNAME": "samehost",
+    })
+    r = subprocess.run([str(script), "leases4_committed"], env=env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    calls = calls_log.read_text().splitlines()
+    remove_idx = next(i for i, c in enumerate(calls) if "local_data_remove samehost.lab.local." in c)
+    add_idx = next(i for i, c in enumerate(calls)
+                  if "local_data samehost.lab.local. 300 IN A 192.168.1.99" in c)
+    assert remove_idx < add_idx, (
+        "deletion of the stale 'samehost' lease must be applied BEFORE the "
+        "new 'samehost' lease is registered, or the add would be wiped out")
+
+
+@pytest.mark.skipif(not _bash_available(), reason="bash not available")
+def test_script_removes_ptr_record_even_when_hostname_is_blank(tmp_path):
+    """PTR removal only needs the IP (the reverse-zone name is derived from
+    it), so a release/expire event with an unparseable/blank hostname must
+    still clean up the PTR entry rather than silently skipping it."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls_log = tmp_path / "calls.log"
+    uc = bin_dir / "unbound-control"
+    uc.write_text(f'#!/bin/bash\necho "$*" >> "{calls_log}"\nexit 0\n')
+    uc.chmod(0o755)
+
+    config = tmp_path / "hook.json"
+    config.write_text(
+        '{"enabled": true, "targets": ["127.0.0.1@8953"], '
+        '"domain": "lab.local", "ttl": 300, "register_ptr": true}')
+    log_path = tmp_path / "hook.log"
+    body = h.render_script().replace(
+        h.DNS_HOOK_CONFIG_PATH, str(config)).replace(
+        h.DNS_HOOK_LOG_PATH, str(log_path))
+    script = tmp_path / "lm-dns-sync.sh"
+    script.write_text(body)
+    script.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env.update({"LEASE4_ADDRESS": "192.168.1.77", "LEASE4_HOSTNAME": ""})
+    r = subprocess.run([str(script), "lease4_release"], env=env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    calls = calls_log.read_text().splitlines()
+    assert "-s 127.0.0.1@8953 local_data_remove 77.1.168.192.in-addr.arpa." in calls
+
+
+@pytest.mark.skipif(not _bash_available(), reason="bash not available")
+def test_script_logs_partial_when_only_some_targets_accept(tmp_path):
+    """Multi-resolver deployment: if only one of two targets accepts the
+    update, that must be visibly logged as PARTIAL, not silently treated as
+    a clean success (which would hide DNS drift between resolvers)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls_log = tmp_path / "calls.log"
+    uc = bin_dir / "unbound-control"
+    uc.write_text(
+        f'#!/bin/bash\necho "$*" >> "{calls_log}"\n'
+        'if [[ "$*" == *9999* ]]; then exit 1; fi\nexit 0\n')
+    uc.chmod(0o755)
+
+    config = tmp_path / "hook.json"
+    config.write_text(
+        '{"enabled": true, "targets": ["127.0.0.1@8953", "127.0.0.1@9999"], '
+        '"domain": "lab.local", "ttl": 300, "register_ptr": false}')
+    log_path = tmp_path / "hook.log"
+    body = h.render_script().replace(
+        h.DNS_HOOK_CONFIG_PATH, str(config)).replace(
+        h.DNS_HOOK_LOG_PATH, str(log_path))
+    script = tmp_path / "lm-dns-sync.sh"
+    script.write_text(body)
+    script.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env.update({"LEASES4_SIZE": "1", "LEASES4_AT0_ADDRESS": "192.168.1.50",
+                "LEASES4_AT0_HOSTNAME": "myhost"})
+    r = subprocess.run([str(script), "leases4_committed"], env=env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    log_text = log_path.read_text()
+    assert "PARTIAL A  myhost.lab.local. -> 192.168.1.50" in log_text
 
 
 @pytest.mark.skipif(not _bash_available(), reason="bash not available")
@@ -337,13 +491,17 @@ def test_handle_command_non_cluster_dns_hook_config_requires_settings():
 
 
 class _Transport:
-    def __init__(self, reply):
+    def __init__(self, reply, member_ids=None):
         self._reply = reply
         self.calls = []
+        self._member_ids = member_ids
 
     async def fanout(self, command, data, timeout=20.0, member_ids=None):
         self.calls.append((command, data))
         return self._reply
+
+    def member_ids(self):
+        return self._member_ids or []
 
 
 class _Cluster:
@@ -353,10 +511,10 @@ class _Cluster:
         self.transport = transport
 
 
-def _ha_spoke(fanout_reply):
+def _ha_spoke(fanout_reply, member_ids=None):
     from dhcp_spoke import DHCPSpoke
     obj = object.__new__(DHCPSpoke)
-    obj.cluster = _Cluster(_Transport(fanout_reply))
+    obj.cluster = _Cluster(_Transport(fanout_reply, member_ids=member_ids))
     return obj
 
 
@@ -391,3 +549,26 @@ def test_handle_command_ha_dns_hook_status_returns_per_member_not_merged():
     res = asyncio.run(obj.handle_command("DHCP_DNS_HOOK_STATUS", {}))
     assert res["members"]["node-a"]["settings"]["enabled"] is True
     assert res["members"]["node-b"]["settings"]["enabled"] is False
+
+
+def test_handle_command_ha_dns_hook_config_missing_member_is_not_success():
+    # node-b never answers at all (e.g. disconnected) — dropped entirely
+    # from `results`, not present with an explicit error. Without comparing
+    # against the transport's own member_ids(), this used to read as a
+    # clean SUCCESS because `errors` built only from `results` was empty.
+    import asyncio
+    reply = {"results": {"node-a": {"status": "SUCCESS"}}}
+    obj = _ha_spoke(reply, member_ids=["node-a", "node-b"])
+    res = asyncio.run(obj.handle_command(
+        "DHCP_DNS_HOOK_CONFIG", {"settings": {"enabled": True}}))
+    assert res["status"] == "ERROR"
+    assert res["member_errors"]["node-b"] == "no response"
+
+
+def test_handle_command_ha_dns_hook_status_missing_member_is_not_success():
+    import asyncio
+    reply = {"results": {"node-a": {"status": "SUCCESS", "settings": {"enabled": True}}}}
+    obj = _ha_spoke(reply, member_ids=["node-a", "node-b"])
+    res = asyncio.run(obj.handle_command("DHCP_DNS_HOOK_STATUS", {}))
+    assert res["status"] == "ERROR"
+    assert res["member_errors"]["node-b"] == "no response"
