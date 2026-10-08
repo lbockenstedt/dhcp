@@ -17,6 +17,11 @@ import shutil
 import subprocess
 import zlib
 
+try:
+    import kea_dns_hook
+except ImportError:  # loaded as a package (src.X) by the sibling entrypoint
+    from src import kea_dns_hook  # type: ignore
+
 logger = logging.getLogger("KeaManager")
 
 
@@ -584,6 +589,69 @@ class KeaManager:
 
         logger.info("Synced %d subnets, %d reservations to Kea", len(kea_subnets), len(reservations))
         return {"status": "SUCCESS", "subnets": len(kea_subnets), "reservations": len(reservations)}
+
+    # ── Real-time DNS registration hook (Option 1) ─────────────────────
+
+    def configure_dns_hook(self, settings: dict, hook_dir: str = "") -> dict:
+        """Enable/update/disable the real-time Kea -> Unbound ``run_script``
+        hook on this node.
+
+        Mirrors ``sync()``'s get_config -> mutate -> apply_config shape, but
+        only ever touches the ONE ``hooks-libraries`` entry this feature owns
+        (see ``kea_dns_hook.remove_dns_hook_entry``) — every other entry
+        (``lease_cmds``, ``ha``, an operator's own hooks) passes through
+        untouched, same guarantee ``sync()`` gives ``subnet4`` relative to the
+        rest of the config.
+        """
+        try:
+            clean = kea_dns_hook.validate_settings(settings)
+        except kea_dns_hook.DnsHookConfigError as e:
+            return {"status": "ERROR", "message": str(e)}
+
+        try:
+            cfg = self.get_config()
+        except Exception as e:
+            return {"status": "ERROR", "message": f"Cannot read Kea config: {e}"}
+
+        hooks = kea_dns_hook.remove_dns_hook_entry(cfg.get("hooks-libraries", []))
+        if clean["enabled"]:
+            hooks.append(kea_dns_hook.build_dns_hook_entry(hook_dir))
+        cfg["hooks-libraries"] = hooks
+
+        try:
+            kea_dns_hook.write_hook_files(clean)
+        except OSError as e:
+            return {"status": "ERROR", "message": f"Cannot write hook files: {e}"}
+
+        result = self.apply_config(cfg)
+        if not result.get("set"):
+            return {"status": "ERROR", "message": result.get("error", "config-set failed")}
+        if not result.get("written"):
+            # Running config IS updated (hook is live); only persistence
+            # failed — same "mutated but not durable" case apply_config's own
+            # docstring calls out, surfaced here rather than swallowed.
+            return {"status": "PARTIAL", "message": result.get("error", "config-write failed"),
+                    "enabled": clean["enabled"]}
+        logger.info("DNS hook %s (targets=%s)", "enabled" if clean["enabled"] else "disabled",
+                    clean["targets"])
+        return {"status": "SUCCESS", "enabled": clean["enabled"], "settings": clean}
+
+    def dns_hook_status(self) -> dict:
+        """On-disk hook settings/log tail, independent of whether Kea's
+        running config currently loads the hook (so a drifted/removed
+        hooks-libraries entry is still diagnosable)."""
+        status = kea_dns_hook.read_status()
+        try:
+            hooks = self.get_config().get("hooks-libraries", []) or []
+            status["loaded_in_running_config"] = any(
+                str(h.get("library", "")).endswith(kea_dns_hook.RUN_SCRIPT_LIB)
+                and (h.get("parameters") or {}).get("name") == kea_dns_hook.DNS_HOOK_SCRIPT_PATH
+                for h in hooks if isinstance(h, dict)
+            )
+        except Exception as e:  # noqa: BLE001
+            status["loaded_in_running_config"] = None
+            status["running_config_error"] = str(e)
+        return status
 
     # ── Lease queries ─────────────────────────────────────────────────
 

@@ -59,6 +59,7 @@ The spoke couples the Lab Manager control plane with ISC Kea DHCP servers throug
 - **Live Lease Inspection & Diagnostics:** Inspect active leases per subnet or fleet-wide, remove orphaned leases, and view interface binding states.
 - **Real-Time Statistics:** Live packet accounting (`pkt4_received`, `pkt4_discover`, `pkt4_request`, `pkt4_offer_sent`, `pkt4_ack_sent`, `pkt4_nak_sent`) and continuous per-pool utilization percentages.
 - **High-Availability (HA) Clustering:** Built-in multi-member hot-standby clustering with heartbeat tracking, automated failover state monitoring, and automated mTLS certificate rotation.
+- **Real-Time DNS Registration:** Optional Kea `run_script` hook that registers/retracts a client's A record (and, optionally, PTR) directly in Unbound via `unbound-control` the moment a lease is committed, renewed, released, expired, or declined — no dependency on the Lab Manager hub or any NetBox sync cycle. See [Real-Time DNS Registration](#real-time-dns-registration) below.
 
 ---
 
@@ -85,6 +86,8 @@ The spoke communicates with the Lab Manager hub over an authenticated WebSocket 
 | `DHCP_HA_APPLY` | None | Re-applies the last-known desired state across all cluster members. |
 | `DHCP_HA_ENROLL_WORKERS` | `workers` | Pre-stages worker enrollment credentials and certificates for new HA nodes. |
 | `DHCP_HA_COMMIT_ENROLLMENT`| None | Finalizes worker enrollment and activates the updated cluster topology. |
+| `DHCP_DNS_HOOK_CONFIG` | `settings` (`enabled`, `targets`, `domain`, `ttl`, `register_ptr`), `hook_dir` *(optional)* | Enables/updates/disables the real-time Kea → Unbound `run_script` hook. |
+| `DHCP_DNS_HOOK_STATUS` | None | Returns the hook's on-disk settings, whether it's loaded in the running Kea config, and a tail of its own event log. |
 
 ---
 
@@ -108,6 +111,45 @@ The worker tier daemon (`dhcp_worker.py`) executes localized commands on behalf 
 | `KEAW_DEL_LEASE` | `ip` | Evicts an active lease directly from the local Kea lease storage. |
 | `KEAW_DIAGNOSTICS` | None | Captures local daemon unit status, journal entries, and system resource metrics. |
 | `KEAW_STATS` | None | Gathers raw performance and packet statistics from local Kea daemon. |
+| `KEAW_DNS_HOOK_CONFIG` | `settings`, `hook_dir` *(optional)* | Enables/updates/disables the real-time DNS `run_script` hook on this node only. |
+| `KEAW_DNS_HOOK_STATUS` | None | This node's on-disk hook settings, running-config load state, and log tail. |
+
+---
+
+## Real-Time DNS Registration
+
+`DHCP_DNS_HOOK_CONFIG` installs a Kea `run_script` hook (`libdhcp_run_script.so`) that calls
+`unbound-control local_data` / `local_data_remove` directly — in real time, on every lease
+commit/renewal/release/expiry/decline — with **no dependency on the Lab Manager hub or the
+NetBox sync loop**. This is "Option 1" of the two complementary DHCP→DNS paths:
+
+1. **Real-time (this feature).** Fast (sub-second), works even if the hub is unreachable, but
+   registrations live only in Unbound's in-memory `local_data` table — an `unbound-control
+   reload` or service restart silently drops them until the next DHCP event for that client.
+2. **NetBox-mediated fallback.** Durable: once a lease has a corresponding record in NetBox
+   (static reservations write back immediately; dynamic leases flow through the hub's firewall/
+   DHCP discovery sync into NetBox), the hub's `dns_dhcp_sync` loop re-applies it to Unbound's
+   on-disk `conf.d` every cycle, surviving restarts.
+
+Settings (`DHCP_DNS_HOOK_CONFIG`'s `settings` object):
+
+| Field | Default | Description |
+| :--- | :--- | :--- |
+| `enabled` | `false` | Load/unload the hook in Kea's `hooks-libraries`. |
+| `targets` | `["127.0.0.1@8953"]` | One or more `host@port` `unbound-control -s` targets. Defaults to the local resolver — the out-of-the-box `install_dns.sh` setup is loopback-only, so a remote/multi-host target requires manually opening Unbound's `control-interface` and copying its remote-control certs to the Kea host. |
+| `domain` | `""` | Suffix appended to a bare (no-dot) client hostname, e.g. `myhost` + `lab.local` → `myhost.lab.local`. |
+| `ttl` | `300` | TTL (seconds) applied to each `local_data` record. |
+| `register_ptr` | `false` | Also register/retract a best-effort `in-addr.arpa.` PTR record (IPv4 only; assumes the reverse zone is already configured in Unbound). A-record registration always happens regardless of this flag. |
+
+Only a lease with a non-empty hostname is registered — whether Kea populates one at all (from a
+client's DHCP Option 12/81, or a static reservation) is controlled by Kea's own global DDNS/
+hostname settings, unrelated to this hook. Client-supplied hostnames are treated as untrusted
+input and validated against the same naming rule the `dns` spoke itself enforces before ever
+reaching `unbound-control`; anything that fails is skipped (and logged), never passed through.
+
+In an HA pair, `DHCP_DNS_HOOK_CONFIG`/`_STATUS` fan out to **every** member with the same
+settings — each node runs its own hook against its own Kea process, independent of which node is
+currently serving.
 
 ---
 
