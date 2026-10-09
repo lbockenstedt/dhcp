@@ -609,3 +609,62 @@ def test_handle_command_ha_dns_hook_status_preserves_member_error_messages():
     assert res["member_errors"]["node-b"] == "cannot read running config"
     assert res["member_errors"]["node-c"] == "hook files missing"
     assert res["member_errors"]["node-d"] == "no response"
+
+
+@pytest.mark.skipif(not _bash_available(), reason="bash not available")
+def test_script_suffixes_lease_scope_domain_with_global_fallback(tmp_path):
+    """A single-label lease hostname gets ITS Kea subnet's domain-name option
+    (the DHCP scope's domain); a subnet without one falls back to the hook's
+    global ``domain``; a dotted hostname is left alone."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls_log = tmp_path / "calls.log"
+    uc = bin_dir / "unbound-control"
+    uc.write_text(f'#!/bin/bash\necho "$*" >> "{calls_log}"\nexit 0\n')
+    uc.chmod(0o755)
+    kea_conf = tmp_path / "kea-dhcp4.conf"
+    kea_conf.write_text(
+        '// generated\n{"Dhcp4": {"subnet4": [\n'
+        '  {"id": 1, "subnet": "10.0.1.0/24", "option-data": [{"name": "domain-name", "data": "Scope1.Example."}]},\n'
+        '  {"id": 2, "subnet": "10.0.2.0/24", "option-data": [{"name": "routers", "data": "10.0.2.1"}]},\n'
+        '  {"id": 4, "subnet": "10.0.4.0/24", "option-data": [{"name": "domain-name", "data": "bad domain"}]}],\n'
+        ' "shared-networks": [{"subnet4": [\n'
+        '  {"id": 3, "subnet": "10.0.3.0/24", "option-data": [{"name": "domain-name", "data": "shared.example"}]}]}]}}\n')
+    config = tmp_path / "hook.json"
+    config.write_text(
+        '{"enabled": true, "targets": ["127.0.0.1@8953"], "domain": "lab.local", '
+        f'"ttl": 300, "register_ptr": false, "kea_config": "{kea_conf}"}}')
+    body = h.render_script().replace(
+        h.DNS_HOOK_CONFIG_PATH, str(config)).replace(
+        h.DNS_HOOK_LOG_PATH, str(tmp_path / "hook.log"))
+    script = tmp_path / "lm-dns-sync.sh"
+    script.write_text(body)
+    script.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env.update({
+        "LEASES4_SIZE": "5",
+        "LEASES4_AT0_ADDRESS": "10.0.1.5", "LEASES4_AT0_HOSTNAME": "printer1", "LEASES4_AT0_SUBNET_ID": "1",
+        "LEASES4_AT1_ADDRESS": "10.0.2.5", "LEASES4_AT1_HOSTNAME": "laptop2", "LEASES4_AT1_SUBNET_ID": "2",
+        "LEASES4_AT2_ADDRESS": "10.0.3.5", "LEASES4_AT2_HOSTNAME": "cam3", "LEASES4_AT2_SUBNET_ID": "3",
+        "LEASES4_AT3_ADDRESS": "10.0.1.6", "LEASES4_AT3_HOSTNAME": "fq.other.org", "LEASES4_AT3_SUBNET_ID": "1",
+        "LEASES4_AT4_ADDRESS": "10.0.4.5", "LEASES4_AT4_HOSTNAME": "tv4", "LEASES4_AT4_SUBNET_ID": "4",
+        "DELETED_LEASES4_SIZE": "1", "DELETED_LEASES4_AT0_ADDRESS": "10.0.1.9",
+        "DELETED_LEASES4_AT0_HOSTNAME": "gone", "DELETED_LEASES4_AT0_SUBNET_ID": "1",
+    })
+    r = subprocess.run([str(script), "leases4_committed"], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    calls = calls_log.read_text().splitlines()
+    assert "-s 127.0.0.1@8953 local_data printer1.scope1.example. 300 IN A 10.0.1.5" in calls
+    assert "-s 127.0.0.1@8953 local_data laptop2.lab.local. 300 IN A 10.0.2.5" in calls
+    assert "-s 127.0.0.1@8953 local_data cam3.shared.example. 300 IN A 10.0.3.5" in calls
+    assert "-s 127.0.0.1@8953 local_data fq.other.org. 300 IN A 10.0.1.6" in calls
+    assert "-s 127.0.0.1@8953 local_data tv4.lab.local. 300 IN A 10.0.4.5" in calls
+    assert "-s 127.0.0.1@8953 local_data_remove gone.scope1.example." in calls
+
+    calls_log.write_text("")
+    env2 = {k: v for k, v in env.items() if not k.startswith(("LEASES4_", "DELETED_LEASES4_"))}
+    env2.update({"LEASE4_ADDRESS": "10.0.3.7", "LEASE4_HOSTNAME": "bye", "LEASE4_SUBNET_ID": "3"})
+    r = subprocess.run([str(script), "lease4_expire"], env=env2, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert calls_log.read_text().splitlines() == ["-s 127.0.0.1@8953 local_data_remove bye.shared.example."]
