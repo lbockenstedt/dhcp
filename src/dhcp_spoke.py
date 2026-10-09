@@ -883,10 +883,13 @@ class DHCPSpoke(BaseSpoke):
         expected = set(getattr(self.cluster.transport, "member_ids", lambda: [])() or []) | set(results.keys())
         ok_ids = {m for m, r in results.items()
                   if isinstance(r, dict) and r.get("status") == "SUCCESS"}
-        missing = sorted(expected - ok_ids)
-        status = "ERROR" if missing else "SUCCESS"
+        errors = {}
+        for member_id in sorted(expected - ok_ids):
+            reply = results.get(member_id) or {}
+            errors[member_id] = reply.get("message") or reply.get("status") or "no response"
+        status = "ERROR" if errors else "SUCCESS"
         return {"status": status, "members": results,
-                "member_errors": {m: "no response" for m in missing}}
+                "member_errors": errors}
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch incoming spoke command to corresponding local or cluster handler."""
@@ -1157,7 +1160,9 @@ class DHCPSpoke(BaseSpoke):
 
         if cmd == "DHCP_DNS_HOOK_STATUS":
             status = await asyncio.to_thread(self.mgr.dns_hook_status)
-            return {"status": "SUCCESS", **status}
+            top_status = ("PARTIAL" if status.get("loaded_in_running_config") is None
+                          or status.get("running_config_error") else "SUCCESS")
+            return {"status": top_status, **status}
 
         return {"status": "ERROR", "error": f"Unknown command: {command_type}"}
 
