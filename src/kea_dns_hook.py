@@ -31,6 +31,12 @@ dns_dhcp_sync.py``) is the durable backstop: once a Kea lease has a writeback
 record in NetBox (see the ``fw_discovery_sync`` "kea" source), that loop
 re-applies it to Unbound's on-disk ``conf.d`` every cycle regardless of
 whether the in-memory entry survived a restart.
+
+A bare (single-label) lease hostname is suffixed with the ``domain-name``
+option of the lease's own Kea subnet (``*_SUBNET_ID`` -> subnet4 /
+shared-networks in ``/etc/kea/kea-dhcp4.conf``), i.e. the DHCP scope's
+domain, falling back to the global ``domain`` setting. This matches the hub's
+NetBox -> DNS sync, which uses the same scope ``domain_name``.
 """
 
 import json
@@ -224,6 +230,7 @@ log() {{ echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') [$HOOK] $*" >> "$LOG" 2>/dev/nul
 # validation were ever bypassed).
 ENABLED=false DOMAIN= TTL=300 REGISTER_PTR=false
 TARGETS=()
+SUBNET_DOMAINS=""
 while IFS= read -r _line; do
     case "$_line" in
         ENABLED=*) ENABLED="${{_line#ENABLED=}}" ;;
@@ -231,6 +238,7 @@ while IFS= read -r _line; do
         TTL=*) TTL="${{_line#TTL=}}" ;;
         REGISTER_PTR=*) REGISTER_PTR="${{_line#REGISTER_PTR=}}" ;;
         TARGET:*) TARGETS+=("${{_line#TARGET:}}") ;;
+        SUBNETDOM:*) SUBNET_DOMAINS="${{SUBNET_DOMAINS}} ${{_line#SUBNETDOM:}}" ;;
     esac
 done < <(python3 - "$CONFIG" 2>>"$LOG" <<'PY'
 import json, sys
@@ -246,6 +254,41 @@ print(f"TTL={{int(c.get('ttl', 300) or 300)}}")
 print(f"REGISTER_PTR={{'true' if c.get('register_ptr') else 'false'}}")
 for t in (c.get('targets') or ['127.0.0.1@8953']):
     print(f"TARGET:{{t}}")
+# Per-scope domain: Kea subnet id -> its domain-name option, read fresh from
+# the Kea config on disk so a DHCP_SYNC scope change needs no hook
+# reconfigure. (No apostrophes here: bash 3.2 misparses them inside <(...).)
+import re
+DOM_RE = re.compile(r"^(?!-)[A-Za-z0-9_-]{{1,63}}(?<!-)(?:\\.(?!-)[A-Za-z0-9_-]{{1,63}}(?<!-))*$")
+kea = {{}}
+try:
+    with open(c.get("kea_config") or "/etc/kea/kea-dhcp4.conf") as fh:
+        raw = fh.read()
+    try:
+        kea = json.loads(raw)
+    except ValueError:
+        kea = json.loads("\\n".join(l for l in raw.splitlines() if not l.lstrip().startswith(("//", "#"))))
+except Exception:
+    kea = {{}}
+d4 = kea.get("Dhcp4") if isinstance(kea, dict) else None
+if not isinstance(d4, dict):
+    d4 = {{}}
+subnets = list(d4.get("subnet4") or [])
+for sn in d4.get("shared-networks") or []:
+    if isinstance(sn, dict):
+        subnets.extend(sn.get("subnet4") or [])
+for s in subnets:
+    if not isinstance(s, dict) or s.get("id") is None:
+        continue
+    try:
+        sid = int(s['id'])
+    except (TypeError, ValueError):
+        continue
+    for o in s.get("option-data") or []:
+        if isinstance(o, dict) and o.get("name") == "domain-name":
+            dom = str(o.get("data") or "").strip().strip(chr(34)).rstrip(".").lower()
+            if dom and DOM_RE.match(dom):
+                print(f"SUBNETDOM:{{sid}}={{dom}}")
+            break
 PY
 )
 [ "${{ENABLED:-false}}" = "true" ] || exit 0
@@ -253,10 +296,24 @@ PY
 
 NAME_RE='^[A-Za-z0-9_]([A-Za-z0-9_-]{{0,61}}[A-Za-z0-9_])?(\\.[A-Za-z0-9_]([A-Za-z0-9_-]{{0,61}}[A-Za-z0-9_])?)*\\.?$'
 
+# Domain of the lease's Kea subnet ("" when the scope sets no domain-name).
+_scope_domain() {{
+    local id="${{1:-}}" l
+    [ -z "$id" ] && return 1
+    # Space-separated "id=domain" pairs (both validated: never contain blanks).
+    for l in $SUBNET_DOMAINS; do
+        [ "${{l%%=*}}" = "$id" ] && {{ printf '%s' "${{l#*=}}"; return 0; }}
+    done
+    return 1
+}}
+
+# $1 = lease hostname, $2 = Kea subnet id. A single-label name gets the
+# lease scope's domain-name, else the hook's global DOMAIN.
 _fqdn() {{
-    local h="${{1%.}}"
+    local h="${{1%.}}" dom="${{DOMAIN:-}}" sd
     [ -z "$h" ] && return 1
-    if [[ "$h" != *.* && -n "${{DOMAIN:-}}" ]]; then h="${{h}}.${{DOMAIN}}"; fi
+    sd=$(_scope_domain "${{2:-}}") && [ -n "$sd" ] && dom="$sd"
+    if [[ "$h" != *.* && -n "$dom" ]]; then h="${{h}}.${{dom}}"; fi
     h=$(printf '%s' "$h" | tr 'A-Z' 'a-z')  # portable lowercase (bash 3.2 lacks ${{var,,}})
     [[ "$h" =~ $NAME_RE ]] || return 1
     printf '%s' "$h"
@@ -296,7 +353,7 @@ _log_uc_result() {{
 
 add_record() {{
     local ip="$1" fqdn rc
-    fqdn=$(_fqdn "$2") || {{ log "skip $ip — no usable hostname"; return; }}
+    fqdn=$(_fqdn "$2" "${{3:-}}") || {{ log "skip $ip — no usable hostname"; return; }}
     _uc local_data "${{fqdn}}. ${{TTL}} IN A ${{ip}}"; rc=$?
     _log_uc_result "$rc" "A  ${{fqdn}}. -> ${{ip}}"
     if [ "${{REGISTER_PTR:-false}}" = "true" ]; then
@@ -319,7 +376,7 @@ remove_record() {{
             _log_uc_result "$rc" "removed PTR ${{ptr}}"
         fi
     fi
-    fqdn=$(_fqdn "$2") || return
+    fqdn=$(_fqdn "$2" "${{3:-}}") || return
     _uc local_data_remove "${{fqdn}}."; rc=$?
     _log_uc_result "$rc" "removed A ${{fqdn}}."
 }}
@@ -336,21 +393,23 @@ case "$HOOK" in
     if [ "$d" -gt 0 ] 2>/dev/null; then
         for i in $(seq 0 $((d-1))); do
             addrvar="DELETED_LEASES4_AT${{i}}_ADDRESS"; hostvar="DELETED_LEASES4_AT${{i}}_HOSTNAME"
-            ip="${{!addrvar:-}}"; host="${{!hostvar:-}}"
-            [ -n "$ip" ] && remove_record "$ip" "$host"
+            subvar="DELETED_LEASES4_AT${{i}}_SUBNET_ID"
+            ip="${{!addrvar:-}}"; host="${{!hostvar:-}}"; sub="${{!subvar:-}}"
+            [ -n "$ip" ] && remove_record "$ip" "$host" "$sub"
         done
     fi
     n="${{LEASES4_SIZE:-0}}"
     if [ "$n" -gt 0 ] 2>/dev/null; then
         for i in $(seq 0 $((n-1))); do
             addrvar="LEASES4_AT${{i}}_ADDRESS"; hostvar="LEASES4_AT${{i}}_HOSTNAME"
-            ip="${{!addrvar:-}}"; host="${{!hostvar:-}}"
-            [ -n "$ip" ] && add_record "$ip" "$host"
+            subvar="LEASES4_AT${{i}}_SUBNET_ID"
+            ip="${{!addrvar:-}}"; host="${{!hostvar:-}}"; sub="${{!subvar:-}}"
+            [ -n "$ip" ] && add_record "$ip" "$host" "$sub"
         done
     fi
     ;;
   lease4_release|lease4_expire|lease4_decline)
-    [ -n "${{LEASE4_ADDRESS:-}}" ] && remove_record "$LEASE4_ADDRESS" "${{LEASE4_HOSTNAME:-}}"
+    [ -n "${{LEASE4_ADDRESS:-}}" ] && remove_record "$LEASE4_ADDRESS" "${{LEASE4_HOSTNAME:-}}" "${{LEASE4_SUBNET_ID:-}}"
     ;;
   *)
     ;;
