@@ -905,7 +905,10 @@ class DhcpWorkerOps:
     def dns_hook_status(self, _data: Dict[str, Any]) -> Dict[str, Any]:
         """``KEAW_DNS_HOOK_STATUS`` — this node's on-disk hook settings, whether
         the running Kea config currently loads it, and a log tail."""
-        return {"status": "SUCCESS", **self.mgr.dns_hook_status()}
+        status = self.mgr.dns_hook_status()
+        top_status = ("PARTIAL" if status.get("loaded_in_running_config") is None
+                      or status.get("running_config_error") else "SUCCESS")
+        return {"status": top_status, **status}
 
     def op_table(self) -> Dict[str, Any]:
         """Map KEAW operations to bound handler methods."""
