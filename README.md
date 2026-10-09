@@ -135,9 +135,9 @@ Settings (`DHCP_DNS_HOOK_CONFIG`'s `settings` object):
 
 | Field | Default | Description |
 | :--- | :--- | :--- |
-| `enabled` | `false` | Load/unload the hook in Kea's `hooks-libraries`. |
+| `enabled` | `false` | Load/unload the hook in Kea's `hooks-libraries`. The spoke default is off, but the Lab Manager hub turns it **on** by default and keeps it converged to `global_config.dhcp_dns_hook` (WebUI: System → Sync → *DHCP → DNS (real-time)*). |
 | `targets` | `["127.0.0.1@8953"]` | One or more `host@port` `unbound-control -s` targets. Defaults to the local resolver — the out-of-the-box `install_dns.sh` setup is loopback-only, so a remote/multi-host target requires manually opening Unbound's `control-interface` and copying its remote-control certs to the Kea host. |
-| `domain` | `""` | Suffix appended to a bare (no-dot) client hostname, e.g. `myhost` + `lab.local` → `myhost.lab.local`. |
+| `domain` | `""` | **Fallback** suffix for a bare (no-dot) client hostname. The lease's own scope domain wins: the `domain-name` option of the Kea subnet the lease belongs to (`SUBNET_ID`, read from `/etc/kea/kea-dhcp4.conf` on every event). Example: `myhost` in a `lab.local` scope → `myhost.lab.local`. |
 | `ttl` | `300` | TTL (seconds) applied to each `local_data` record. |
 | `register_ptr` | `false` | Also register/retract a best-effort `in-addr.arpa.` PTR record (IPv4 only; assumes the reverse zone is already configured in Unbound). A-record registration always happens regardless of this flag. |
 
