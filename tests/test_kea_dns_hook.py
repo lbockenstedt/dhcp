@@ -446,26 +446,31 @@ def test_dns_hook_status_reports_loaded_in_running_config(tmp_path, monkeypatch)
 # ─────────────────────────── DHCPSpoke dispatch ────────────────────────────
 
 class _FakeMgr:
-    def __init__(self):
+    def __init__(self, dns_hook_status_reply=None):
         self.configure_calls = []
+        self._dns_hook_status_reply = dns_hook_status_reply or {
+            "settings": h.default_settings(),
+            "script_installed": True,
+            "loaded_in_running_config": True,
+        }
 
     def configure_dns_hook(self, settings, hook_dir=""):
         self.configure_calls.append((settings, hook_dir))
         return {"status": "SUCCESS", "enabled": settings.get("enabled")}
 
     def dns_hook_status(self):
-        return {"settings": h.default_settings(), "script_installed": True}
+        return dict(self._dns_hook_status_reply)
 
 
 class _NoCluster:
     enabled = False
 
 
-def _non_cluster_spoke():
+def _non_cluster_spoke(dns_hook_status_reply=None):
     from dhcp_spoke import DHCPSpoke
     obj = object.__new__(DHCPSpoke)
     obj.cluster = _NoCluster()
-    obj.mgr = _FakeMgr()
+    obj.mgr = _FakeMgr(dns_hook_status_reply=dns_hook_status_reply)
     return obj
 
 
@@ -481,6 +486,20 @@ def test_handle_command_non_cluster_dns_hook_config_and_status():
     res = asyncio.run(obj.handle_command("DHCP_DNS_HOOK_STATUS", {}))
     assert res["status"] == "SUCCESS"
     assert res["script_installed"] is True
+
+
+def test_handle_command_non_cluster_dns_hook_status_is_partial_when_running_config_read_fails():
+    import asyncio
+    obj = _non_cluster_spoke({
+        "settings": h.default_settings(),
+        "script_installed": True,
+        "loaded_in_running_config": None,
+        "running_config_error": "control agent down",
+    })
+
+    res = asyncio.run(obj.handle_command("DHCP_DNS_HOOK_STATUS", {}))
+    assert res["status"] == "PARTIAL"
+    assert res["running_config_error"] == "control agent down"
 
 
 def test_handle_command_non_cluster_dns_hook_config_requires_settings():
@@ -572,3 +591,21 @@ def test_handle_command_ha_dns_hook_status_missing_member_is_not_success():
     res = asyncio.run(obj.handle_command("DHCP_DNS_HOOK_STATUS", {}))
     assert res["status"] == "ERROR"
     assert res["member_errors"]["node-b"] == "no response"
+
+
+def test_handle_command_ha_dns_hook_status_preserves_member_error_messages():
+    import asyncio
+    reply = {"results": {
+        "node-a": {"status": "SUCCESS", "settings": {"enabled": True}},
+        "node-b": {"status": "PARTIAL",
+                   "message": "cannot read running config",
+                   "loaded_in_running_config": None,
+                   "running_config_error": "config-get failed"},
+        "node-c": {"status": "ERROR", "message": "hook files missing"},
+    }}
+    obj = _ha_spoke(reply, member_ids=["node-a", "node-b", "node-c", "node-d"])
+    res = asyncio.run(obj.handle_command("DHCP_DNS_HOOK_STATUS", {}))
+    assert res["status"] == "ERROR"
+    assert res["member_errors"]["node-b"] == "cannot read running config"
+    assert res["member_errors"]["node-c"] == "hook files missing"
+    assert res["member_errors"]["node-d"] == "no response"

@@ -76,6 +76,12 @@ class FakeMgr:
         self.calls.append(("get_stats",))
         return {"status": "SUCCESS", "global": {}, "subnets": []}
 
+    def dns_hook_status(self):
+        self.calls.append(("dns_hook_status",))
+        return {"settings": {"enabled": False},
+                "script_installed": True,
+                "loaded_in_running_config": True}
+
     # KeaManager internals used by the worker ops
     def get_config(self):
         if "config-get" in self.rpc_fail:
@@ -402,6 +408,19 @@ def test_get_config_surfaces_an_unreachable_control_agent():
     ops = _ops()
     ops.mgr.rpc_fail.add("config-get")
     assert ops.get_config({})["status"] == "ERROR"
+
+
+def test_worker_dns_hook_status_is_partial_when_running_config_read_fails():
+    ops = _ops()
+    ops.mgr.dns_hook_status = lambda: {
+        "settings": {"enabled": True},
+        "script_installed": True,
+        "loaded_in_running_config": None,
+        "running_config_error": "config-get refused",
+    }
+    out = ops.dns_hook_status({})
+    assert out["status"] == "PARTIAL"
+    assert out["running_config_error"] == "config-get refused"
 
 
 def test_config_write_failure_restores_locally_and_reports_not_mutated():
