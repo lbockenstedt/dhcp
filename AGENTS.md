@@ -1,5 +1,7 @@
 # AGENTS.md — `dhcp`
 
+> **⚠️ RETIRED — do not change this repo.** The live dhcp code ships inside the lm repo at `lm/dhcp/` (installed under `/opt/lm/dhcp`; role has `repo_url: None`). All fixes from this repo were ported there. Make changes in `lbockenstedt/lm` → `dhcp/`. See `lm/docs/code-consolidation-backlog.md`.
+
 **Kea DHCP module.**
 
 - **Repo:** `github.com/lbockenstedt/dhcp`

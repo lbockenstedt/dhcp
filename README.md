@@ -1,5 +1,7 @@
 # dhcp — Kea DHCP Spoke (Lab Manager Module)
 
+> **⚠️ RETIRED — do not change this repo.** The live dhcp code ships inside the lm repo at `lm/dhcp/` (installed under `/opt/lm/dhcp`; role has `repo_url: None`). All fixes from this repo were ported there. Make changes in `lbockenstedt/lm` → `dhcp/`. See `lm/docs/code-consolidation-backlog.md`.
+
 The `dhcp` module is the authoritative ISC Kea DHCPv4/v6 management spoke for the Lab Manager (LM) ecosystem. It provides automated subnet and pool management, static host reservations, real-time lease inspection, live utilization statistics, and high-availability (HA) clustering across redundant Kea daemon instances.
 
 ---
